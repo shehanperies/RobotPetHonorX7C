@@ -46,17 +46,12 @@ class RobotLink {
         disconnect()
         if (!url.startsWith("ws://") && !url.startsWith("wss://")) return
 
-        val request = Request.Builder()
-            .url(url)
-            .build()
+        val request = Request.Builder().url(url).build()
 
         socket = client.newWebSocket(
             request,
             object : WebSocketListener() {
-                override fun onOpen(
-                    webSocket: WebSocket,
-                    response: Response
-                ) {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
                     _telemetry.value = _telemetry.value.copy(
                         connected = true,
                         lastSeenMs = System.currentTimeMillis()
@@ -64,10 +59,7 @@ class RobotLink {
                     startHeartbeat()
                 }
 
-                override fun onMessage(
-                    webSocket: WebSocket,
-                    text: String
-                ) {
+                override fun onMessage(webSocket: WebSocket, text: String) {
                     runCatching {
                         val j = JSONObject(text)
                         if (j.optString("type") == "telemetry") {
@@ -76,14 +68,10 @@ class RobotLink {
                                 safeToMove = j.optBoolean("safeToMove", false),
                                 obstacleCm = if (j.has("obstacleCm")) {
                                     j.optDouble("obstacleCm").toFloat()
-                                } else {
-                                    null
-                                },
+                                } else null,
                                 batteryPercent = if (j.has("batteryPercent")) {
                                     j.optInt("batteryPercent")
-                                } else {
-                                    null
-                                },
+                                } else null,
                                 lastSeenMs = System.currentTimeMillis()
                             )
                         }
@@ -94,45 +82,26 @@ class RobotLink {
                     webSocket: WebSocket,
                     code: Int,
                     reason: String
-                ) {
-                    markDisconnected()
-                }
+                ) = markDisconnected()
 
                 override fun onFailure(
                     webSocket: WebSocket,
                     t: Throwable,
                     response: Response?
-                ) {
-                    markDisconnected()
-                }
+                ) = markDisconnected()
             }
         )
     }
 
-    fun send(
-        command: MotionCommand,
-        durationMs: Long = 0L
-    ) {
+    fun send(command: MotionCommand, durationMs: Long = 0L) {
         val blocked = command != MotionCommand.STOP &&
             !_telemetry.value.safeToMove
 
-        val actual = if (blocked) {
-            MotionCommand.STOP
-        } else {
-            command
-        }
-
-        val actualDuration = if (actual == MotionCommand.STOP) {
-            0L
-        } else {
-            durationMs
-        }
+        val actual = if (blocked) MotionCommand.STOP else command
+        val actualDuration = if (actual == MotionCommand.STOP) 0L else durationMs
 
         val queued = socket?.send(
-            RobotProtocol.commandJson(
-                actual,
-                actualDuration
-            )
+            RobotProtocol.commandJson(actual, actualDuration)
         ) == true
 
         _debug.value = RobotLinkDebug(

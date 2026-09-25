@@ -12,9 +12,8 @@ android {
         applicationId = "com.shehan.robotpet"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.2.0"
-
+        versionCode = 3
+        versionName = "0.3.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -55,7 +54,6 @@ dependencies {
     implementation("androidx.camera:camera-camera2:1.6.2")
     implementation("androidx.camera:camera-lifecycle:1.6.2")
     implementation("com.google.mlkit:face-detection:16.1.7")
-    implementation("com.google.mlkit:object-detection:17.0.2")
     implementation("com.google.mediapipe:tasks-vision:1.0.0")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

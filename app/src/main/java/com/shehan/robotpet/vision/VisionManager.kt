@@ -12,12 +12,9 @@ import androidx.lifecycle.LifecycleOwner
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
-import com.google.mlkit.vision.objects.ObjectDetection
-import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
 import com.shehan.robotpet.brain.HandGesture
 import com.shehan.robotpet.brain.VisionObservation
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 
 class VisionManager(
@@ -27,41 +24,51 @@ class VisionManager(
     private val executor = Executors.newSingleThreadExecutor()
     private var provider: ProcessCameraProvider? = null
     private var usingFrontCamera = true
+
     private val gestureManager = GestureManager(context)
+    private val objectManager = ObjectDetectorManager(context)
 
     private val faceDetector = FaceDetection.getClient(
         FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+            .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
             .enableTracking()
             .setMinFaceSize(0.12f)
             .build()
     )
 
-    private val objectDetector = ObjectDetection.getClient(
-        ObjectDetectorOptions.Builder()
-            .setDetectorMode(ObjectDetectorOptions.STREAM_MODE)
-            .enableMultipleObjects()
-            .enableClassification()
-            .build()
-    )
-
     fun start(owner: LifecycleOwner) {
         val future = ProcessCameraProvider.getInstance(context)
+
         future.addListener({
             provider = future.get()
+
             val analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
+
             analysis.setAnalyzer(executor) { analyze(it) }
             provider?.unbindAll()
+
             val front = runCatching {
                 usingFrontCamera = true
-                provider?.bindToLifecycle(owner, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+                provider?.bindToLifecycle(
+                    owner,
+                    CameraSelector.DEFAULT_FRONT_CAMERA,
+                    analysis
+                )
             }
+
             if (front.isFailure) {
                 usingFrontCamera = false
-                runCatching { provider?.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, analysis) }
+                runCatching {
+                    provider?.bindToLifecycle(
+                        owner,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        analysis
+                    )
+                }
             }
         }, ContextCompat.getMainExecutor(context))
     }
@@ -92,9 +99,7 @@ class VisionManager(
         )
 
         val rotation = Matrix().apply {
-            postRotate(
-                proxy.imageInfo.rotationDegrees.toFloat()
-            )
+            postRotate(proxy.imageInfo.rotationDegrees.toFloat())
         }
 
         val rotated = Bitmap.createBitmap(
@@ -108,10 +113,7 @@ class VisionManager(
         )
 
         val bitmap = if (usingFrontCamera) {
-            val mirror = Matrix().apply {
-                preScale(-1f, 1f)
-            }
-
+            val mirror = Matrix().apply { preScale(-1f, 1f) }
             Bitmap.createBitmap(
                 rotated,
                 0,
@@ -125,57 +127,37 @@ class VisionManager(
             rotated
         }
 
-        val input = InputImage.fromBitmap(bitmap, 0)
+        val now = System.currentTimeMillis()
         val width = bitmap.width.toFloat().coerceAtLeast(1f)
         val height = bitmap.height.toFloat().coerceAtLeast(1f)
-        val gestureFrame = runCatching { gestureManager.analyze(bitmap) }.getOrNull()
 
-        var faceVisible = false
-        var faceX = 0.5f
-        var faceY = 0.5f
-        var faceArea = 0f
-        var objectCount = 0
-        var objectX = 0.5f
-        var objectLabel: String? = null
-        val pending = AtomicInteger(2)
+        val gesture = runCatching {
+            gestureManager.analyze(bitmap)
+        }.getOrNull()
 
-        fun done() {
-            if (pending.decrementAndGet() == 0) {
-                var gesture = gestureFrame?.gesture ?: HandGesture.NONE
-                val handX = gestureFrame?.centerX ?: 0.5f
-                val handY = gestureFrame?.centerY ?: 0.5f
+        val obj = runCatching {
+            objectManager.analyze(bitmap, now)
+        }.getOrDefault(ObjectFrame())
 
-                if (
-                    gesture == HandGesture.POINT_UP &&
-                    faceVisible &&
-                    abs(handX - faceX) < 0.18f &&
-                    abs(handY - faceY) < 0.30f
-                ) {
-                    gesture = HandGesture.SHH
-                }
-
-                onObservation(
-                    VisionObservation(
-                        faceVisible = faceVisible,
-                        faceCenterX = faceX,
-                        faceAreaRatio = faceArea,
-                        objectCount = objectCount,
-                        objectCenterX = objectX,
-                        objectLabel = objectLabel,
-                        faceCenterY = faceY,
-                        handGesture = gesture,
-                        handConfidence = gestureFrame?.confidence ?: 0f,
-                        handCenterX = handX,
-                        handCenterY = handY
-                    )
-                )
-                proxy.close()
-            }
-        }
+        val input = InputImage.fromBitmap(bitmap, 0)
 
         faceDetector.process(input)
             .addOnSuccessListener { faces ->
-                val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
+                val face = faces.maxByOrNull {
+                    it.boundingBox.width() * it.boundingBox.height()
+                }
+
+                var faceVisible = false
+                var faceX = 0.5f
+                var faceY = 0.5f
+                var faceArea = 0f
+                var smile = -1f
+                var leftEye = -1f
+                var rightEye = -1f
+                var eulerX = 0f
+                var eulerY = 0f
+                var eulerZ = 0f
+
                 if (face != null) {
                     faceVisible = true
                     faceX = (face.boundingBox.centerX() / width).coerceIn(0f, 1f)
@@ -184,20 +166,61 @@ class VisionManager(
                         (face.boundingBox.width() * face.boundingBox.height()) /
                             (width * height)
                         ).coerceIn(0f, 1f)
-                }
-            }
-            .addOnCompleteListener { done() }
 
-        objectDetector.process(input)
-            .addOnSuccessListener { objects ->
-                objectCount = objects.size
-                val obj = objects.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
-                if (obj != null) {
-                    objectX = (obj.boundingBox.centerX() / width).coerceIn(0f, 1f)
-                    objectLabel = obj.labels.maxByOrNull { it.confidence }?.text
+                    smile = face.smilingProbability ?: -1f
+                    leftEye = face.leftEyeOpenProbability ?: -1f
+                    rightEye = face.rightEyeOpenProbability ?: -1f
+                    eulerX = face.headEulerAngleX
+                    eulerY = face.headEulerAngleY
+                    eulerZ = face.headEulerAngleZ
                 }
+
+                var handGesture = gesture?.gesture ?: HandGesture.NONE
+                val handX = gesture?.centerX ?: 0.5f
+                val handY = gesture?.centerY ?: 0.5f
+
+                // Pointing near the mouth area is treated as "shh".
+                if (
+                    handGesture == HandGesture.POINT_UP &&
+                    faceVisible &&
+                    abs(handX - faceX) < 0.18f &&
+                    handY > faceY - 0.05f &&
+                    abs(handY - faceY) < 0.30f
+                ) {
+                    handGesture = HandGesture.SHH
+                }
+
+                onObservation(
+                    VisionObservation(
+                        faceVisible = faceVisible,
+                        faceCenterX = faceX,
+                        faceCenterY = faceY,
+                        faceAreaRatio = faceArea,
+                        smileProbability = smile,
+                        leftEyeOpenProbability = leftEye,
+                        rightEyeOpenProbability = rightEye,
+                        headEulerX = eulerX,
+                        headEulerY = eulerY,
+                        headEulerZ = eulerZ,
+
+                        objectCount = obj.count,
+                        objectCenterX = obj.centerX,
+                        objectCenterY = obj.centerY,
+                        objectAreaRatio = obj.areaRatio,
+                        objectLabel = obj.label,
+                        objectConfidence = obj.confidence,
+
+                        handGesture = handGesture,
+                        handConfidence = gesture?.confidence ?: 0f,
+                        handCenterX = handX,
+                        handCenterY = handY,
+                        timestampMs = now
+                    )
+                )
             }
-            .addOnCompleteListener { done() }
+            .addOnCompleteListener {
+                proxy.close()
+            }
     }
 
     fun stop() {
@@ -207,8 +230,8 @@ class VisionManager(
     fun shutdown() {
         stop()
         faceDetector.close()
-        objectDetector.close()
         gestureManager.close()
+        objectManager.close()
         executor.shutdown()
     }
 }

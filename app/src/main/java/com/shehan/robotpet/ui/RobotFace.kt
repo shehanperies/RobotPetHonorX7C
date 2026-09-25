@@ -3,6 +3,7 @@ package com.shehan.robotpet.ui
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
@@ -28,16 +29,18 @@ fun RobotFace(
     gazeX: Float,
     gazeY: Float,
     onTouch: () -> Unit,
+    onPet: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val blink = remember { Animatable(1f) }
     var drift by remember { mutableFloatStateOf(0f) }
+    var dragDistance by remember { mutableFloatStateOf(0f) }
 
     LaunchedEffect(Unit) {
         while (true) {
-            delay(Random.nextLong(2800, 6500))
-            blink.animateTo(0.05f, tween(75))
-            blink.animateTo(1f, tween(120))
+            delay(Random.nextLong(2600, 6200))
+            blink.animateTo(0.05f, tween(70))
+            blink.animateTo(1f, tween(115))
             drift = Random.nextFloat() * 0.1f - 0.05f
         }
     }
@@ -45,8 +48,21 @@ fun RobotFace(
     Canvas(
         modifier
             .fillMaxSize()
-            .pointerInput(Unit) {
+            .pointerInput(onTouch) {
                 detectTapGestures { onTouch() }
+            }
+            .pointerInput(onPet) {
+                detectDragGestures(
+                    onDragStart = { dragDistance = 0f },
+                    onDrag = { change, amount ->
+                        dragDistance += amount.getDistance()
+                        change.consume()
+                    },
+                    onDragEnd = {
+                        if (dragDistance > 120f) onPet()
+                        dragDistance = 0f
+                    }
+                )
             }
     ) {
         val w = size.width
@@ -56,12 +72,14 @@ fun RobotFace(
 
         val emotionScale = when (emotion) {
             Emotion.HAPPY -> 0.58f
+            Emotion.LOVE -> 0.52f
             Emotion.SLEEPY -> 0.22f
             Emotion.LISTENING -> 1.08f
             Emotion.STARTLED -> 1.18f
-            Emotion.SAD -> 0.66f
+            Emotion.SAD, Emotion.LONELY -> 0.66f
             Emotion.ANGRY -> 0.62f
             Emotion.PLAYFUL -> 0.82f
+            Emotion.DIZZY -> 0.76f
             else -> 1f
         }
 
@@ -74,10 +92,11 @@ fun RobotFace(
 
         val glow = when (emotion) {
             Emotion.ANGRY -> Color(0xFFFF675C)
-            Emotion.SAD -> Color(0xFF79A8FF)
-            Emotion.PLAYFUL -> Color(0xFFC38BFF)
+            Emotion.SAD, Emotion.LONELY -> Color(0xFF79A8FF)
+            Emotion.PLAYFUL, Emotion.DIZZY -> Color(0xFFC38BFF)
             Emotion.STARTLED -> Color(0xFFFFD86A)
             Emotion.HAPPY -> Color(0xFF79F5D0)
+            Emotion.LOVE -> Color(0xFFFF8FCB)
             else -> Color(0xFF7DE7FF)
         }
 
@@ -89,10 +108,7 @@ fun RobotFace(
                         center.x - eyeW * 0.56f,
                         center.y - eyeH * 0.62f
                     ),
-                    size = Size(
-                        eyeW * 1.12f,
-                        eyeH * 1.24f
-                    ),
+                    size = Size(eyeW * 1.12f, eyeH * 1.24f),
                     cornerRadius = CornerRadius(eyeH * 0.48f)
                 )
 
@@ -114,9 +130,11 @@ fun RobotFace(
         val tilt = when (emotion) {
             Emotion.CURIOUS -> 4f
             Emotion.STARTLED -> -5f
-            Emotion.SAD -> 9f
+            Emotion.SAD, Emotion.LONELY -> 9f
             Emotion.ANGRY -> -11f
             Emotion.PLAYFUL -> -3f
+            Emotion.DIZZY -> 12f
+            Emotion.LOVE -> -2f
             else -> 0f
         }
 

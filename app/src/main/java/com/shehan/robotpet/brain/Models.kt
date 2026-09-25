@@ -1,8 +1,13 @@
 package com.shehan.robotpet.brain
 
-enum class Emotion { IDLE, HAPPY, CURIOUS, LISTENING, SLEEPY, STARTLED, SAD, ANGRY, PLAYFUL }
+enum class Emotion {
+    IDLE, HAPPY, CURIOUS, LISTENING, SLEEPY, STARTLED, SAD,
+    ANGRY, PLAYFUL, LOVE, DIZZY, LONELY
+}
 
-enum class MotionCommand { STOP, FORWARD, BACKWARD, LEFT, RIGHT, FORK_UP, FORK_DOWN }
+enum class MotionCommand {
+    STOP, FORWARD, BACKWARD, LEFT, RIGHT, FORK_UP, FORK_DOWN
+}
 
 enum class HandGesture {
     NONE,
@@ -13,26 +18,60 @@ enum class HandGesture {
     POINT_LEFT,
     POINT_RIGHT,
     POINT_UP,
+    POINT_DOWN,
     COME_HERE,
+    TURN_AROUND,
     SHH,
     PEACE,
+    LOVE,
     FIST,
     HIT_SWING
 }
 
+enum class PhoneEvent {
+    NONE, SHAKE, TILT_LEFT, TILT_RIGHT, UPSIDE_DOWN, DARK, BRIGHT
+}
+
+data class MotionStep(
+    val command: MotionCommand,
+    val durationMs: Long,
+    val delayAfterMs: Long = 80L
+)
+
 data class VisionObservation(
     val faceVisible: Boolean = false,
     val faceCenterX: Float = 0.5f,
+    val faceCenterY: Float = 0.5f,
     val faceAreaRatio: Float = 0f,
+    val smileProbability: Float = -1f,
+    val leftEyeOpenProbability: Float = -1f,
+    val rightEyeOpenProbability: Float = -1f,
+    val headEulerX: Float = 0f,
+    val headEulerY: Float = 0f,
+    val headEulerZ: Float = 0f,
+
     val objectCount: Int = 0,
     val objectCenterX: Float = 0.5f,
+    val objectCenterY: Float = 0.5f,
+    val objectAreaRatio: Float = 0f,
     val objectLabel: String? = null,
-    val timestampMs: Long = System.currentTimeMillis(),
-    val faceCenterY: Float = 0.5f,
+    val objectConfidence: Float = 0f,
+
     val handGesture: HandGesture = HandGesture.NONE,
     val handConfidence: Float = 0f,
     val handCenterX: Float = 0.5f,
-    val handCenterY: Float = 0.5f
+    val handCenterY: Float = 0.5f,
+
+    val timestampMs: Long = System.currentTimeMillis()
+)
+
+data class PhoneObservation(
+    val event: PhoneEvent = PhoneEvent.NONE,
+    val pitchDeg: Float = 0f,
+    val rollDeg: Float = 0f,
+    val gForce: Float = 1f,
+    val lux: Float? = null,
+    val timestampMs: Long = System.currentTimeMillis()
 )
 
 data class RobotTelemetry(
@@ -50,5 +89,6 @@ data class BrainDecision(
     val speech: String? = null,
     val motion: MotionCommand = MotionCommand.STOP,
     val motionDurationMs: Long = 0L,
+    val sequence: List<MotionStep> = emptyList(),
     val status: String = "Idle"
 )
