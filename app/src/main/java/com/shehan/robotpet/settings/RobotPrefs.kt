@@ -13,6 +13,12 @@ class RobotPrefs(context: Context) {
         get() = p.getBoolean("follow_enabled", true)
         set(value) = p.edit().putBoolean("follow_enabled", value).apply()
 
+    var wakeWordEnabled: Boolean
+        get() = p.getBoolean("wake_word_enabled", true)
+        set(value) = p.edit().putBoolean("wake_word_enabled", value).apply()
+
+    val wakeWord: String get() = "Welly"
+
     var voiceLanguage: String
         get() = p.getString("voice_language", "en-US") ?: "en-US"
         set(value) = p.edit().putString("voice_language", value.trim().ifBlank { "en-US" }).apply()
@@ -26,8 +32,12 @@ class RobotPrefs(context: Context) {
         set(value) = p.edit().putString("voice_preset", value).apply()
 
     var robotName: String
-        get() = p.getString("robot_name", "Milo") ?: "Milo"
-        set(value) = p.edit().putString("robot_name", value.trim().ifBlank { "Milo" }).apply()
+        get() {
+            val saved = p.getString("robot_name", null)
+            if (saved.isNullOrBlank() || saved == "Milo") return "Welly"
+            return saved
+        }
+        set(value) = p.edit().putString("robot_name", value.trim().ifBlank { "Welly" }).apply()
 
     var ownerName: String
         get() = p.getString("owner_name", "") ?: ""
@@ -36,8 +46,8 @@ class RobotPrefs(context: Context) {
     var characterInstructions: String
         get() = p.getString(
             "character_instructions",
-            "Curious, playful, affectionate and independent. Short natural replies. Sometimes self-play, sometimes quietly observe."
-        ) ?: "Curious, playful, affectionate and independent."
+            "Welly is curious, playful, affectionate and independent. Short natural replies. Sometimes self-play, sometimes quietly observe."
+        ) ?: "Welly is curious, playful, affectionate and independent."
         set(value) = p.edit().putString("character_instructions", value.trim()).apply()
 
     var characterNeverDo: String
@@ -66,31 +76,24 @@ class RobotPrefs(context: Context) {
     var mood: Int
         get() = p.getInt("mood", 0)
         set(value) = p.edit().putInt("mood", value.coerceIn(-100, 100)).apply()
-
     var annoyance: Int
         get() = p.getInt("annoyance", 0)
         set(value) = p.edit().putInt("annoyance", value.coerceIn(0, 100)).apply()
-
     var socialNeed: Int
         get() = p.getInt("social_need", 20)
         set(value) = p.edit().putInt("social_need", value.coerceIn(0, 100)).apply()
-
     var boredom: Int
         get() = p.getInt("boredom", 15)
         set(value) = p.edit().putInt("boredom", value.coerceIn(0, 100)).apply()
-
     var curiosity: Int
         get() = p.getInt("curiosity", 45)
         set(value) = p.edit().putInt("curiosity", value.coerceIn(0, 100)).apply()
-
     var energy: Int
         get() = p.getInt("energy", 90)
         set(value) = p.edit().putInt("energy", value.coerceIn(0, 100)).apply()
-
     var affection: Int
         get() = p.getInt("affection", 50)
         set(value) = p.edit().putInt("affection", value.coerceIn(0, 100)).apply()
-
     var confidence: Int
         get() = p.getInt("confidence", 50)
         set(value) = p.edit().putInt("confidence", value.coerceIn(0, 100)).apply()

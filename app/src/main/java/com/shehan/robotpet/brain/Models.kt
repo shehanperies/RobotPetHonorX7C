@@ -10,27 +10,12 @@ enum class MotionCommand {
 }
 
 enum class HandGesture {
-    NONE,
-    WAVE,
-    OPEN_PALM,
-    THUMBS_UP,
-    THUMBS_DOWN,
-    POINT_LEFT,
-    POINT_RIGHT,
-    POINT_UP,
-    POINT_DOWN,
-    COME_HERE,
-    TURN_AROUND,
-    SHH,
-    PEACE,
-    LOVE,
-    FIST,
-    HIT_SWING
+    NONE, WAVE, OPEN_PALM, THUMBS_UP, THUMBS_DOWN,
+    POINT_LEFT, POINT_RIGHT, POINT_UP, POINT_DOWN,
+    COME_HERE, TURN_AROUND, SHH, PEACE, LOVE, FIST, HIT_SWING
 }
 
-enum class PhoneEvent {
-    NONE, SHAKE, TILT_LEFT, TILT_RIGHT, UPSIDE_DOWN, DARK, BRIGHT
-}
+enum class PhoneEvent { NONE, SHAKE, TILT_LEFT, TILT_RIGHT, UPSIDE_DOWN, DARK, BRIGHT }
 
 enum class PetMode {
     IDLE, ENGAGED, FOLLOWING, SEARCHING, LISTENING, CONVERSATION,
@@ -43,24 +28,12 @@ enum class AiAction {
 }
 
 enum class DecisionSource {
-    SAFETY,
-    REMOTE,
-    DIRECT_COMMAND,
-    LISTENING,
-    GESTURE,
-    TOUCH,
-    FOLLOW,
-    SEARCH,
-    VISION,
-    PHONE,
-    BATTERY,
-    AI,
-    IDLE
+    SAFETY, REMOTE, DIRECT_COMMAND, LISTENING, GESTURE, TOUCH,
+    FOLLOW, SEARCH, VISION, PHONE, BATTERY, AI, IDLE
 }
 
-enum class BehaviorResource {
-    DRIVE, FORK, FACE, SPEECH, MIC
-}
+/** PRIMARY is the one-at-a-time behavior lane. Other resources are physical/output lanes. */
+enum class BehaviorResource { PRIMARY, DRIVE, FORK, FACE, SPEECH, MIC }
 
 data class AiDirective(
     val action: AiAction = AiAction.NONE,
@@ -111,7 +84,6 @@ data class VisionObservation(
     val kissConfidence: Float = 0f,
     val kissDetected: Boolean = false,
     val blownKissDetected: Boolean = false,
-
     val objects: List<DetectedObject> = emptyList(),
     val objectCount: Int = 0,
     val objectCenterX: Float = 0.5f,
@@ -119,7 +91,6 @@ data class VisionObservation(
     val objectAreaRatio: Float = 0f,
     val objectLabel: String? = null,
     val objectConfidence: Float = 0f,
-
     val handPresent: Boolean = false,
     val rawHandLabel: String = "",
     val handGesture: HandGesture = HandGesture.NONE,
@@ -128,7 +99,6 @@ data class VisionObservation(
     val handConfidence: Float = 0f,
     val handCenterX: Float = 0.5f,
     val handCenterY: Float = 0.5f,
-
     val timestampMs: Long = System.currentTimeMillis()
 )
 

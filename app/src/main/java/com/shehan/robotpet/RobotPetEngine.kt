@@ -31,6 +31,7 @@ import com.shehan.robotpet.settings.RobotPrefs
 import com.shehan.robotpet.vision.VisionManager
 import com.shehan.robotpet.voice.VoiceDebug
 import com.shehan.robotpet.voice.VoiceManager
+import com.shehan.robotpet.voice.WakeWordManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -49,12 +50,10 @@ data class PetUiState(
     val mode: PetMode = PetMode.IDLE,
     val gazeX: Float = 0f,
     val gazeY: Float = 0f,
-    val status: String = "Starting V6",
-
+    val status: String = "Starting Welly V7",
     val robotConnected: Boolean = false,
     val safeToMove: Boolean = false,
     val obstacleCm: Float? = null,
-
     val lastGesture: HandGesture = HandGesture.NONE,
     val gestureCandidate: HandGesture = HandGesture.NONE,
     val gestureStage: String = "NONE",
@@ -67,18 +66,14 @@ data class PetUiState(
     val kissConfidence: Float = 0f,
     val kissDetected: Boolean = false,
     val blownKissDetected: Boolean = false,
-
     val phoneEvent: PhoneEvent = PhoneEvent.NONE,
     val phoneBattery: Int = -1,
     val phoneCharging: Boolean = false,
-
     val voice: VoiceDebug = VoiceDebug(),
     val lastHeard: String = "",
-
     val mind: PetMindSnapshot = PetMindSnapshot(),
     val gemini: GeminiStatus = GeminiStatus(),
     val remote: RemoteServerInfo = RemoteServerInfo(),
-
     val testing: Boolean = false,
     val simEsp: Boolean = false,
     val activeBehavior: String = "idle",
@@ -94,7 +89,6 @@ data class PetUiState(
     val espAckSeq: Long = 0L,
     val espAckAccepted: Boolean? = null,
     val espAckReason: String = "",
-
     val eventLog: List<String> = emptyList()
 )
 
@@ -109,19 +103,33 @@ class RobotPetEngine(private val context: Context) {
     private var realTelemetry = RobotTelemetry()
     private var vision: VisionManager? = null
     private var latestVision = VisionObservation()
+    private var wakeWord: WakeWordManager? = null
 
     private var lastCommand = MotionCommand.STOP
     private var lastCommandMs = 0L
     private var lastDriveTxMs = 0L
     private var lastForkTxMs = 0L
     private var sequenceJob: Job? = null
+    private var sequenceKey = ""
     private var motionStopJob: Job? = null
+    private var motionKey = ""
 
     @Volatile private var remoteManual = false
     private var remoteLastCommandMs = 0L
     private var remoteLastMotion = MotionCommand.STOP
     private var lastAutonomousAiMs = System.currentTimeMillis()
     private val touchTimes = ArrayDeque<Long>()
+
+    // V7 event fusion. Vision still updates the world continuously, but behavior is sampled
+    // and only meaningful/stable events enter the one-at-a-time executive.
+    private var lastBrainVisionSampleMs = 0L
+    private var previousFaceVisible = false
+    private var stableObjectKey = ""
+    private var stableObjectSinceMs = 0L
+    private var lastObjectEventKey = ""
+    private var lastObjectEventMs = 0L
+    private var lastVisionSubmitKey = ""
+    private var lastVisionSubmitMs = 0L
 
     private val _ui = MutableStateFlow(PetUiState())
     val ui: StateFlow<PetUiState> = _ui
@@ -159,30 +167,45 @@ class RobotPetEngine(private val context: Context) {
             scope.launch {
                 _ui.value = _ui.value.copy(lastHeard = text)
                 addLog("VOICE: $text")
-                if (brain.isDirectVoiceCommand(text)) {
-                    submit(brain.onSpeech(text, effectiveTelemetry()), DecisionSource.DIRECT_COMMAND)
-                } else if (_ui.value.gemini.enabled && _ui.value.gemini.keyConfigured) {
-                    _ui.value = _ui.value.copy(
-                        mode = PetMode.THINKING,
-                        emotion = Emotion.THINKING,
-                        status = "Thinking…"
+                val q = text.trim().lowercase()
+                when {
+                    q.contains("your name") || q.contains("who are you") -> submit(
+                        BrainDecision(
+                            emotion = Emotion.HAPPY,
+                            mode = PetMode.CONVERSATION,
+                            speech = "I'm Welly.",
+                            status = "Welly",
+                            behaviorKey = "identity-welly",
+                            minimumHoldMs = 1600L
+                        ),
+                        DecisionSource.DIRECT_COMMAND
                     )
-                    gemini.plan(
-                        context = geminiContext(),
-                        reason = "user spoke",
-                        userText = text,
-                        bypassRateLimit = true
-                    )
-                } else {
-                    submit(brain.onSpeech(text, effectiveTelemetry()), DecisionSource.DIRECT_COMMAND)
+                    brain.isDirectVoiceCommand(text) ->
+                        submit(brain.onSpeech(text, effectiveTelemetry()), DecisionSource.DIRECT_COMMAND)
+                    _ui.value.gemini.enabled && _ui.value.gemini.keyConfigured -> {
+                        _ui.value = _ui.value.copy(
+                            mode = PetMode.THINKING,
+                            emotion = Emotion.THINKING,
+                            status = "Welly is thinking…"
+                        )
+                        gemini.plan(
+                            context = geminiContext(),
+                            reason = "user spoke to Welly",
+                            userText = text,
+                            bypassRateLimit = true
+                        )
+                    }
+                    else -> submit(brain.onSpeech(text, effectiveTelemetry()), DecisionSource.DIRECT_COMMAND)
                 }
             }
         },
         onFailure = { reason ->
             scope.launch {
                 executive.setListening(false)
+                executive.setSpeaking(false)
                 _ui.value = _ui.value.copy(mode = PetMode.ENGAGED, status = "Voice • $reason")
                 addLog("VOICE ERROR: $reason")
+                wakeWord?.resume(900L)
             }
         },
         onDebug = { debug ->
@@ -190,10 +213,18 @@ class RobotPetEngine(private val context: Context) {
                 val wasListening = _ui.value.voice.listening
                 if (debug.listening && !wasListening) {
                     executive.setListening(true)
+                    executive.setSpeaking(false)
+                    wakeWord?.pause()
                     cancelMotionAndStop("MIC LOCK")
                 } else if (!debug.listening && wasListening) {
                     executive.setListening(false)
                 }
+
+                executive.setSpeaking(debug.phase == "SPEAKING")
+                val busyVoice = debug.listening || debug.phase in setOf(
+                    "STARTING_MIC", "LISTENING", "HEARING", "PROCESSING", "SPEAKING", "RETRYING", "FALLBACK"
+                )
+                if (busyVoice) wakeWord?.pause() else if (!remoteManual) wakeWord?.resume(850L)
 
                 _ui.value = _ui.value.copy(
                     voice = debug,
@@ -204,13 +235,14 @@ class RobotPetEngine(private val context: Context) {
                     },
                     mode = if (debug.listening) PetMode.LISTENING else _ui.value.mode,
                     status = when (debug.phase) {
-                        "STARTING_MIC" -> "Starting microphone…"
-                        "LISTENING" -> "Listening"
-                        "HEARING" -> "I can hear you"
-                        "PROCESSING" -> "Processing…"
-                        "SPEAKING" -> "Speaking…"
-                        else -> if (debug.listening) "Listening…" else _ui.value.status
+                        "STARTING_MIC" -> "Welly • starting microphone…"
+                        "LISTENING" -> "Welly • listening"
+                        "HEARING" -> "Welly • I can hear you"
+                        "PROCESSING" -> "Welly • processing…"
+                        "SPEAKING" -> "Welly • speaking…"
+                        else -> if (debug.listening) "Welly • listening…" else _ui.value.status
                     },
+                    activeBehavior = executive.activePrimaryKey(),
                     executiveLocks = executive.activeLocks()
                 )
             }
@@ -225,6 +257,13 @@ class RobotPetEngine(private val context: Context) {
         )
         voice.applySettings(prefs.voiceLanguage, prefs.voiceName, prefs.voicePreset)
         phoneSensors.start()
+
+        wakeWord = WakeWordManager(
+            context = context,
+            languageProvider = { prefs.voiceLanguage },
+            onWake = { scope.launch { onWakeWordDetected() } },
+            onState = { state -> if (_ui.value.testing) addLog(state) }
+        ).also { manager -> if (prefs.wakeWordEnabled) manager.start() }
 
         if (prefs.remoteEnabled) runCatching { remoteServer.startRemote() }
             .onFailure { addLog("REMOTE START FAIL: ${it.message}") }
@@ -241,12 +280,17 @@ class RobotPetEngine(private val context: Context) {
                     )
                 }
                 if (becameUnsafe) {
-                    val d = BrainDecision(
-                        Emotion.STARTLED, PetMode.EMERGENCY,
-                        motion = MotionCommand.STOP, interruptMotion = true,
-                        status = "SAFETY STOP", behaviorKey = "safety-stop", minimumHoldMs = 1000L
+                    submit(
+                        BrainDecision(
+                            Emotion.STARTLED, PetMode.EMERGENCY,
+                            motion = MotionCommand.STOP,
+                            interruptMotion = true,
+                            status = "SAFETY STOP",
+                            behaviorKey = "safety-stop",
+                            minimumHoldMs = 1000L
+                        ),
+                        DecisionSource.SAFETY
                     )
-                    submit(d, DecisionSource.SAFETY)
                 }
             }
         }
@@ -277,15 +321,22 @@ class RobotPetEngine(private val context: Context) {
             }
         }
 
-        // Local living-brain heartbeat. It proposes idle behavior; the executive may reject it.
+        // Only this loop starts idle/spontaneous behavior. Camera frames may update the world,
+        // but they no longer start random idle actions.
         scope.launch {
             while (isActive) {
                 delay(2200L)
                 if (!_ui.value.voice.listening && !remoteManual) {
-                    submit(brain.idleTick(effectiveTelemetry()), DecisionSource.IDLE)
+                    val d = brain.idleTick(effectiveTelemetry())
+                    if (isActionful(d)) {
+                        submit(d, DecisionSource.IDLE)
+                    } else if (!executive.hasActivePrimary()) {
+                        applyAmbient(d)
+                    }
                 }
                 _ui.value = _ui.value.copy(
                     mind = brain.mindSnapshot(),
+                    activeBehavior = executive.activePrimaryKey(),
                     executiveLocks = executive.activeLocks()
                 )
             }
@@ -299,7 +350,6 @@ class RobotPetEngine(private val context: Context) {
             }
         }
 
-        // Rare AI planning only: no 12-second polling. Local brain is always primary.
         scope.launch {
             while (isActive) {
                 delay(5 * 60_000L)
@@ -307,6 +357,7 @@ class RobotPetEngine(private val context: Context) {
                 if (
                     _ui.value.gemini.enabled && _ui.value.gemini.keyConfigured &&
                     !_ui.value.gemini.busy && !_ui.value.voice.listening && !remoteManual &&
+                    !executive.hasActivePrimary(now) &&
                     now - lastAutonomousAiMs > 10 * 60_000L && brain.shouldRequestAi(now)
                 ) {
                     lastAutonomousAiMs = now
@@ -327,6 +378,18 @@ class RobotPetEngine(private val context: Context) {
         }
     }
 
+    private suspend fun onWakeWordDetected() {
+        if (remoteManual || _ui.value.voice.listening) return
+        cancelMotionAndStop("WAKE WORD WELLY")
+        _ui.value = _ui.value.copy(
+            emotion = Emotion.LISTENING,
+            mode = PetMode.LISTENING,
+            status = "Welly heard you • listening…"
+        )
+        delay(220L)
+        if (!remoteManual && !_ui.value.voice.listening) voice.listen(prefs.voiceLanguage)
+    }
+
     fun startVision(owner: LifecycleOwner) {
         if (vision != null) return
         vision = VisionManager(
@@ -339,7 +402,13 @@ class RobotPetEngine(private val context: Context) {
 
     fun connectRobot() { if (!_ui.value.simEsp) link.connect(prefs.robotUrl) }
     fun disconnectRobot() { cancelMotionAndStop("DISCONNECT"); link.disconnect() }
-    fun listen() { if (!_ui.value.voice.listening) voice.listen(prefs.voiceLanguage) }
+
+    fun listen() {
+        if (_ui.value.voice.listening) return
+        wakeWord?.pause()
+        voice.listen(prefs.voiceLanguage)
+    }
+
     fun testVoice() = voice.testVoice()
     fun previewVoice(language: String, voiceName: String, preset: String) = voice.previewVoice(language, voiceName, preset)
 
@@ -391,7 +460,7 @@ class RobotPetEngine(private val context: Context) {
         prefs.voiceLanguage = voiceLanguage
         prefs.voiceName = voiceName
         prefs.voicePreset = voicePreset
-        prefs.robotName = robotName
+        prefs.robotName = robotName.ifBlank { "Welly" }
         prefs.ownerName = ownerName
         prefs.characterInstructions = characterInstructions
         prefs.characterNeverDo = characterNeverDo
@@ -417,6 +486,7 @@ class RobotPetEngine(private val context: Context) {
             link.disconnect()
             if (url.isNotBlank()) link.connect(url)
         }
+        if (!remoteManual && !_ui.value.voice.listening) wakeWord?.resume(600L)
     }
 
     fun testGemini(keyInput: String) { if (keyInput.isNotBlank()) gemini.saveKey(keyInput); gemini.testConnection() }
@@ -439,8 +509,13 @@ class RobotPetEngine(private val context: Context) {
 
     private fun onVision(v: VisionObservation) {
         latestVision = v
+        val now = v.timestampMs
         val summary = v.objects.take(4).joinToString(" • ") { "${it.label} ${(it.confidence * 100).toInt()}%" }
+
+        // Diagnostics and passive eye tracking are separate from behavior selection.
+        val passiveGaze = if (v.faceVisible) ((v.faceCenterX - 0.5f) * 2f).coerceIn(-1f, 1f) else _ui.value.gazeX
         _ui.value = _ui.value.copy(
+            gazeX = if (!_ui.value.voice.listening) passiveGaze else _ui.value.gazeX,
             lastGesture = v.handGesture,
             gestureCandidate = v.handCandidate,
             gestureStage = v.gestureStage,
@@ -456,55 +531,128 @@ class RobotPetEngine(private val context: Context) {
             mind = brain.mindSnapshot()
         )
 
+        val objectEvent = updateObjectStability(v, now)
+        val faceChanged = v.faceVisible != previousFaceVisible
+        previousFaceVisible = v.faceVisible
+
         if (_ui.value.voice.listening || remoteManual) return
+
+        val immediateEvent = v.handGesture != HandGesture.NONE || v.kissDetected || v.blownKissDetected
+        if (!immediateEvent && now - lastBrainVisionSampleMs < 240L) return
+        lastBrainVisionSampleMs = now
+
+        // PetBrain receives samples so it can maintain face-loss/follow/search state. The result
+        // is NOT automatically executed. Only fused meaningful events reach BehaviorExecutive.
         val d = brain.onVision(v, effectiveTelemetry())
         val source = when {
-            v.handGesture != HandGesture.NONE || v.kissDetected || v.blownKissDetected -> DecisionSource.GESTURE
+            immediateEvent -> DecisionSource.GESTURE
             d.mode == PetMode.FOLLOWING -> DecisionSource.FOLLOW
             d.mode == PetMode.SEARCHING -> DecisionSource.SEARCH
             else -> DecisionSource.VISION
         }
+
+        val meaningful = when {
+            immediateEvent -> true
+            source == DecisionSource.FOLLOW || source == DecisionSource.SEARCH -> true
+            d.interruptMotion || d.motion != MotionCommand.STOP || d.sequence.isNotEmpty() || !d.speech.isNullOrBlank() ->
+                d.mode != PetMode.IDLE || faceChanged || objectEvent
+            objectEvent && d.mode in setOf(PetMode.ENGAGED, PetMode.OBJECT_PLAY) -> true
+            else -> false
+        }
+
+        if (!meaningful) return
+
+        // Final event-level duplicate gate. This sits above detector cooldowns and below the
+        // executive, so the same camera event cannot repeatedly restart a behavior.
+        val key = d.behaviorKey.ifBlank { source.name }
+        val duplicate = key == lastVisionSubmitKey && now - lastVisionSubmitMs < 1100L
+        if (duplicate && source !in setOf(DecisionSource.FOLLOW, DecisionSource.SEARCH, DecisionSource.SAFETY)) return
+        lastVisionSubmitKey = key
+        lastVisionSubmitMs = now
         submit(d, source)
+    }
+
+    private fun updateObjectStability(v: VisionObservation, now: Long): Boolean {
+        val primary = v.objects.firstOrNull()
+        if (primary == null || primary.confidence < 0.44f) {
+            stableObjectKey = ""
+            stableObjectSinceMs = 0L
+            return false
+        }
+        val key = "${primary.label.lowercase()}#${primary.trackId}"
+        if (key != stableObjectKey) {
+            stableObjectKey = key
+            stableObjectSinceMs = now
+            return false
+        }
+        if (now - stableObjectSinceMs < 900L) return false
+        if (key == lastObjectEventKey && now - lastObjectEventMs < 12_000L) return false
+        lastObjectEventKey = key
+        lastObjectEventMs = now
+        return true
     }
 
     private fun onPhone(v: PhoneObservation) {
         _ui.value = _ui.value.copy(phoneEvent = v.event)
-        if (!_ui.value.voice.listening && !remoteManual) brain.onPhone(v)?.let { submit(it, DecisionSource.PHONE) }
+        if (!_ui.value.voice.listening && !remoteManual) {
+            brain.onPhone(v)?.let { submit(it, DecisionSource.PHONE) }
+        }
+    }
+
+    private fun isActionful(d: BrainDecision): Boolean =
+        d.interruptMotion || d.motion != MotionCommand.STOP || d.sequence.isNotEmpty() || !d.speech.isNullOrBlank() ||
+            d.mode in setOf(PetMode.FOLLOWING, PetMode.SEARCHING, PetMode.CONVERSATION, PetMode.OBJECT_PLAY, PetMode.EMERGENCY)
+
+    private fun applyAmbient(d: BrainDecision) {
+        if (_ui.value.voice.listening || _ui.value.voice.phase == "SPEAKING") return
+        _ui.value = _ui.value.copy(
+            emotion = d.emotion,
+            gazeX = d.gazeX,
+            gazeY = d.gazeY,
+            mind = brain.mindSnapshot()
+        )
     }
 
     private fun submit(d: BrainDecision, source: DecisionSource) {
         val result = executive.submit(d, source)
-        val accepted = result.allowed
-        val faceAccepted = BehaviorResource.FACE in accepted
-        val actionAccepted = accepted.any { it != BehaviorResource.FACE }
+        val allowed = result.allowed
+        val primaryAccepted = BehaviorResource.PRIMARY in allowed
+        val faceAccepted = BehaviorResource.FACE in allowed
+        val physicalAccepted = BehaviorResource.DRIVE in allowed || BehaviorResource.FORK in allowed
 
-        if (BehaviorResource.DRIVE in result.preempted || BehaviorResource.FORK in result.preempted) {
-            sequenceJob?.cancel(); sequenceJob = null
-            motionStopJob?.cancel(); motionStopJob = null
+        if (
+            BehaviorResource.PRIMARY in result.preempted ||
+            BehaviorResource.DRIVE in result.preempted ||
+            BehaviorResource.FORK in result.preempted
+        ) {
+            cancelJobsOnly()
             sendCommand(MotionCommand.STOP, 0L, force = true)
         }
 
         _ui.value = _ui.value.copy(
-            emotion = if (faceAccepted) result.decision.emotion else _ui.value.emotion,
-            mode = if (actionAccepted || source in setOf(DecisionSource.VISION, DecisionSource.FOLLOW, DecisionSource.SEARCH, DecisionSource.IDLE)) result.decision.mode else _ui.value.mode,
+            emotion = if (primaryAccepted) result.decision.emotion else _ui.value.emotion,
+            mode = if (primaryAccepted) result.decision.mode else _ui.value.mode,
             gazeX = if (faceAccepted) result.decision.gazeX else _ui.value.gazeX,
             gazeY = if (faceAccepted) result.decision.gazeY else _ui.value.gazeY,
-            status = if (actionAccepted || (faceAccepted && source != DecisionSource.IDLE)) result.decision.status else _ui.value.status,
-            activeBehavior = result.decision.behaviorKey,
+            status = if (primaryAccepted) result.decision.status else _ui.value.status,
+            activeBehavior = executive.activePrimaryKey(),
             executiveLocks = executive.activeLocks(),
-            decisionCommand = result.decision.motion,
+            decisionCommand = if (physicalAccepted || result.decision.interruptMotion) result.decision.motion else _ui.value.decisionCommand,
             mind = brain.mindSnapshot()
         )
 
         if (result.decision.interruptMotion) {
             cancelMotionAndStop("${source.name}:INTERRUPT")
+            if (source != DecisionSource.SAFETY && result.decision.sequence.isNotEmpty()) {
+                executeSequence(result.decision.sequence, result.decision.behaviorKey)
+            }
         } else if (result.decision.sequence.isNotEmpty()) {
-            executeSequence(result.decision.sequence)
+            executeSequence(result.decision.sequence, result.decision.behaviorKey)
         } else if (result.decision.motion != MotionCommand.STOP) {
-            executeMotion(result.decision.motion, result.decision.motionDurationMs)
+            executeMotion(result.decision.motion, result.decision.motionDurationMs, result.decision.behaviorKey)
         }
 
-        if (!result.decision.speech.isNullOrBlank() && BehaviorResource.SPEECH in accepted && !_ui.value.voice.listening) {
+        if (!result.decision.speech.isNullOrBlank() && BehaviorResource.SPEECH in allowed && !_ui.value.voice.listening) {
             voice.speak(result.decision.speech)
         }
 
@@ -513,36 +661,49 @@ class RobotPetEngine(private val context: Context) {
         }
     }
 
-    private fun executeMotion(command: MotionCommand, durationMs: Long) {
+    private fun executeMotion(command: MotionCommand, durationMs: Long, behaviorKey: String) {
+        if (motionStopJob?.isActive == true && motionKey == behaviorKey) return
         motionStopJob?.cancel()
+        motionKey = behaviorKey
         sendCommand(command, durationMs)
         if (durationMs > 0L) {
             motionStopJob = scope.launch {
                 delay(durationMs)
                 sendCommand(MotionCommand.STOP, 0L, force = true)
+                motionKey = ""
             }
         }
     }
 
-    private fun executeSequence(steps: List<com.shehan.robotpet.brain.MotionStep>) {
-        sequenceJob?.cancel()
+    private fun executeSequence(steps: List<com.shehan.robotpet.brain.MotionStep>, behaviorKey: String) {
+        if (sequenceJob?.isActive == true && sequenceKey == behaviorKey) return
+        if (sequenceJob?.isActive == true) return // only executive preemption may cancel another behavior
         motionStopJob?.cancel()
+        sequenceKey = behaviorKey
         sequenceJob = scope.launch {
-            for (step in steps) {
-                if (!isActive || remoteManual || _ui.value.voice.listening) break
-                sendCommand(step.command, step.durationMs, force = true)
-                delay(step.durationMs)
-                sendCommand(MotionCommand.STOP, 0L, force = true)
-                delay(step.delayAfterMs)
+            try {
+                for (step in steps) {
+                    if (!isActive || remoteManual || _ui.value.voice.listening) break
+                    sendCommand(step.command, step.durationMs, force = true)
+                    delay(step.durationMs)
+                    sendCommand(MotionCommand.STOP, 0L, force = true)
+                    delay(step.delayAfterMs)
+                }
+            } finally {
+                sequenceKey = ""
             }
         }
+    }
+
+    private fun cancelJobsOnly() {
+        sequenceJob?.cancel(); sequenceJob = null; sequenceKey = ""
+        motionStopJob?.cancel(); motionStopJob = null; motionKey = ""
     }
 
     private fun cancelMotionAndStop(reason: String) {
-        sequenceJob?.cancel(); sequenceJob = null
-        motionStopJob?.cancel(); motionStopJob = null
+        cancelJobsOnly()
         sendCommand(MotionCommand.STOP, 0L, force = true)
-        addLog("STOP • $reason")
+        if (_ui.value.testing) addLog("STOP • $reason")
     }
 
     private fun sendCommand(command: MotionCommand, durationMs: Long, force: Boolean = false) {
@@ -573,9 +734,7 @@ class RobotPetEngine(private val context: Context) {
                 espAckAccepted = true
             )
             if (_ui.value.testing) addLog("SIM ${command.name} ${durationMs}ms")
-        } else {
-            link.send(command, durationMs)
-        }
+        } else link.send(command, durationMs)
     }
 
     private fun updateBattery() {
@@ -648,7 +807,7 @@ class RobotPetEngine(private val context: Context) {
                 if (!remoteManual) return@launch
                 remoteLastCommandMs = System.currentTimeMillis()
                 remoteLastMotion = command
-                sequenceJob?.cancel(); motionStopJob?.cancel()
+                cancelJobsOnly()
                 sendCommand(command, duration, force = true)
                 _ui.value = _ui.value.copy(mode = PetMode.REMOTE, status = "Remote • ${command.name}")
             }
@@ -659,9 +818,11 @@ class RobotPetEngine(private val context: Context) {
                 executive.setRemoteManual(manual)
                 cancelMotionAndStop("REMOTE MODE CHANGE")
                 remoteLastMotion = MotionCommand.STOP
+                if (manual) wakeWord?.pause() else wakeWord?.resume(700L)
                 _ui.value = _ui.value.copy(
                     mode = if (manual) PetMode.REMOTE else PetMode.IDLE,
-                    status = if (manual) "Remote manual control" else "Autonomous resumed",
+                    status = if (manual) "Remote manual control" else "Welly autonomous",
+                    activeBehavior = executive.activePrimaryKey(),
                     executiveLocks = executive.activeLocks()
                 )
             }
@@ -676,7 +837,8 @@ class RobotPetEngine(private val context: Context) {
 
     fun shutdown() {
         persistMind()
-        sequenceJob?.cancel(); motionStopJob?.cancel()
+        cancelJobsOnly()
+        wakeWord?.shutdown(); wakeWord = null
         phoneSensors.stop()
         vision?.shutdown()
         voice.shutdown()

@@ -1,0 +1,9 @@
+UPLOAD THIS ZIP TO THE ROOT OF RobotPetHonorX7C, THEN IN CODESPACES TERMINAL RUN:
+
+unzip -o RobotPetHonorX7C-V7-Patch.zip
+rm RobotPetHonorX7C-V7-Patch.zip
+git add -A
+git commit -m "Add Welly V7 coordinated behavior and wake word"
+git push
+
+Then wait for GitHub Actions. Do not install the APK unless Unit tests + Build debug APK both succeed.
