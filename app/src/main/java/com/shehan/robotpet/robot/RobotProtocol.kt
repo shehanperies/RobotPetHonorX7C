@@ -4,8 +4,9 @@ import com.shehan.robotpet.brain.MotionCommand
 import org.json.JSONObject
 
 object RobotProtocol {
-    fun commandJson(command: MotionCommand, durationMs: Long): String = JSONObject()
+    fun commandJson(command: MotionCommand, durationMs: Long, seq: Long): String = JSONObject()
         .put("type", "command")
+        .put("seq", seq)
         .put("command", command.name)
         .put("durationMs", durationMs.coerceIn(0, 3000))
         .put("ts", System.currentTimeMillis())

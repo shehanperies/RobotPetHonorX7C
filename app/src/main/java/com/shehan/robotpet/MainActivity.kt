@@ -23,25 +23,18 @@ class MainActivity : ComponentActivity() {
     private val permissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        if (
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.CAMERA
-            ) == PackageManager.PERMISSION_GRANTED
-        ) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             engine.startVision(this)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         enableEdgeToEdge()
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
-            systemBarsBehavior =
-                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
 
         engine = RobotPetEngine(applicationContext)
@@ -50,7 +43,6 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 val ui by engine.ui.collectAsState()
-
                 RobotScreen(
                     ui = ui,
                     initialUrl = engine.currentRobotUrl(),
@@ -58,6 +50,10 @@ class MainActivity : ComponentActivity() {
                     initialVoiceLanguage = engine.currentVoiceLanguage(),
                     initialVoiceName = engine.currentVoiceName(),
                     initialVoicePreset = engine.currentVoicePreset(),
+                    initialRobotName = engine.currentRobotName(),
+                    initialOwnerName = engine.currentOwnerName(),
+                    initialCharacterInstructions = engine.currentCharacterInstructions(),
+                    initialCharacterNeverDo = engine.currentCharacterNeverDo(),
                     initialGeminiEnabled = engine.currentGeminiEnabled(),
                     initialGeminiModel = engine.currentGeminiModel(),
                     initialRemoteEnabled = engine.currentRemoteEnabled(),
@@ -66,6 +62,7 @@ class MainActivity : ComponentActivity() {
                     onPet = engine::pet,
                     onListen = engine::listen,
                     onTestVoice = engine::testVoice,
+                    onPreviewVoice = engine::previewVoice,
                     onConnect = engine::connectRobot,
                     onDisconnect = engine::disconnectRobot,
                     onTestingChanged = engine::setTesting,
@@ -81,26 +78,10 @@ class MainActivity : ComponentActivity() {
 
     private fun requestNeededPermissions() {
         val wanted = buildList {
-            if (
-                ContextCompat.checkSelfPermission(
-                    this@MainActivity,
-                    Manifest.permission.CAMERA
-                ) != PackageManager.PERMISSION_GRANTED
-            ) add(Manifest.permission.CAMERA)
-
-            if (
-                ContextCompat.checkSelfPermission(
-                    this@MainActivity,
-                    Manifest.permission.RECORD_AUDIO
-                ) != PackageManager.PERMISSION_GRANTED
-            ) add(Manifest.permission.RECORD_AUDIO)
+            if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) add(Manifest.permission.CAMERA)
+            if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) add(Manifest.permission.RECORD_AUDIO)
         }
-
-        if (wanted.isEmpty()) {
-            engine.startVision(this)
-        } else {
-            permissions.launch(wanted.toTypedArray())
-        }
+        if (wanted.isEmpty()) engine.startVision(this) else permissions.launch(wanted.toTypedArray())
     }
 
     override fun onDestroy() {

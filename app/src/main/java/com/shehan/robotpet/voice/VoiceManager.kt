@@ -27,15 +27,20 @@ data class VoiceDebug(
     val onDeviceAvailable: Boolean = false,
     val listening: Boolean = false,
     val usingOnDevice: Boolean = false,
+    val phase: String = "IDLE",
     val languageTag: String = "en-US",
     val partialText: String = "",
     val finalText: String = "",
     val error: String = "",
     val rmsDb: Float = -120f,
     val availableLanguages: List<String> = emptyList(),
+    val installedOnDeviceLanguages: List<String> = emptyList(),
+    val onlineLanguages: List<String> = emptyList(),
+    val availableTtsLanguages: List<String> = emptyList(),
     val availableVoices: List<VoiceChoice> = emptyList(),
     val selectedVoiceName: String = "",
-    val voicePreset: String = "Robot"
+    val activeVoiceName: String = "",
+    val voicePreset: String = "Normal"
 )
 
 class VoiceManager(
@@ -54,17 +59,14 @@ class VoiceManager(
     private var ttsReady = false
     private var fallbackTried = false
     private var configuredVoiceName = ""
-    private var configuredPreset = "Robot"
+    private var configuredPreset = "Normal"
 
     private var debug = VoiceDebug(
         recognitionAvailable = SpeechRecognizer.isRecognitionAvailable(context),
-        onDeviceAvailable = Build.VERSION.SDK_INT >= 31 &&
-            SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
+        onDeviceAvailable = Build.VERSION.SDK_INT >= 31 && SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
     )
 
-    init {
-        publish()
-    }
+    init { publish() }
 
     fun listen(languageTag: String = debug.languageTag) {
         tts.stop()
@@ -74,15 +76,16 @@ class VoiceManager(
             languageTag = languageTag.ifBlank { "en-US" },
             partialText = "",
             finalText = "",
-            error = ""
+            error = "",
+            phase = "STARTING_MIC"
         )
-        applyTtsSettings()
+        publish()
         startRecognizer(preferOnDevice = true)
     }
 
     fun applySettings(languageTag: String, voiceName: String, preset: String) {
         configuredVoiceName = voiceName
-        configuredPreset = preset.ifBlank { "Robot" }
+        configuredPreset = preset.ifBlank { "Normal" }
         debug = debug.copy(
             languageTag = languageTag.ifBlank { "en-US" },
             selectedVoiceName = voiceName,
@@ -92,98 +95,125 @@ class VoiceManager(
         publish()
     }
 
-    fun speak(text: String): Boolean {
-        // Never let an autonomous reaction kill an active microphone session.
-        if (debug.listening) return false
+    fun previewVoice(languageTag: String, voiceName: String, preset: String) {
+        if (!ttsReady || debug.listening) return
+        val oldLanguage = debug.languageTag
+        val oldName = configuredVoiceName
+        val oldPreset = configuredPreset
+
+        debug = debug.copy(languageTag = languageTag.ifBlank { oldLanguage })
+        configuredVoiceName = voiceName
+        configuredPreset = preset.ifBlank { oldPreset }
         applyTtsSettings()
-        return tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "robotpet") == TextToSpeech.SUCCESS
+        tts.speak("Hello. This is my voice.", TextToSpeech.QUEUE_FLUSH, null, "robotpet-preview")
+
+        handler.postDelayed({
+            debug = debug.copy(languageTag = oldLanguage)
+            configuredVoiceName = oldName
+            configuredPreset = oldPreset
+            applyTtsSettings()
+            publish()
+        }, 2400L)
     }
 
-    fun testVoice() {
-        if (!debug.listening) speak("Hello. This is my selected voice.")
+    fun speak(text: String): Boolean {
+        if (debug.listening || !ttsReady) return false
+        applyTtsSettings()
+        debug = debug.copy(phase = "SPEAKING")
+        publish()
+        val result = tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "robotpet")
+        handler.postDelayed({
+            if (!debug.listening && debug.phase == "SPEAKING") {
+                debug = debug.copy(phase = "IDLE")
+                publish()
+            }
+        }, (700L + text.length * 48L).coerceAtMost(6500L))
+        return result == TextToSpeech.SUCCESS
     }
+
+    fun testVoice() { if (!debug.listening) speak("Hello. This is my selected voice.") }
 
     private fun startRecognizer(preferOnDevice: Boolean) {
         destroyRecognizer(cancelFirst = true)
-
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
             fail("RECOGNIZER_UNAVAILABLE")
             return
         }
 
-        val canOnDevice = Build.VERSION.SDK_INT >= 31 &&
-            SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
+        val canOnDevice = Build.VERSION.SDK_INT >= 31 && SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
         val useOnDevice = preferOnDevice && canOnDevice
-
         recognizer = try {
-            if (useOnDevice) {
-                SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
-            } else {
-                SpeechRecognizer.createSpeechRecognizer(context)
-            }
+            if (useOnDevice) SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
+            else SpeechRecognizer.createSpeechRecognizer(context)
         } catch (_: Throwable) {
             SpeechRecognizer.createSpeechRecognizer(context)
         }
-
         recognizer?.setRecognitionListener(this)
 
-        val intent = recognitionIntent(debug.languageTag, useOnDevice)
         debug = debug.copy(
             recognitionAvailable = true,
             onDeviceAvailable = canOnDevice,
             listening = true,
             usingOnDevice = useOnDevice,
             partialText = "",
-            error = ""
+            error = "",
+            phase = "STARTING_MIC"
         )
         publish()
-
-        recognizer?.startListening(intent)
+        recognizer?.startListening(recognitionIntent(debug.languageTag, useOnDevice))
     }
 
-    private fun recognitionIntent(languageTag: String, preferOffline: Boolean): Intent {
-        return Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+    private fun recognitionIntent(languageTag: String, preferOffline: Boolean) =
+        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, languageTag)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, preferOffline)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1300L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 750L)
         }
-    }
 
     private fun queryRecognitionLanguages() {
-        if (Build.VERSION.SDK_INT < 33 || !SpeechRecognizer.isRecognitionAvailable(context)) return
+        if (Build.VERSION.SDK_INT < 33 || !SpeechRecognizer.isRecognitionAvailable(context)) {
+            // Do NOT fill this with TTS languages; recognition and synthesis are separate.
+            if (debug.availableLanguages.isEmpty()) {
+                debug = debug.copy(availableLanguages = listOf(debug.languageTag))
+                publish()
+            }
+            return
+        }
 
         runCatching {
             supportProbe?.destroy()
             supportProbe = SpeechRecognizer.createSpeechRecognizer(context)
-            val intent = recognitionIntent(debug.languageTag, false)
             supportProbe?.checkRecognitionSupport(
-                intent,
+                recognitionIntent(debug.languageTag, false),
                 context.mainExecutor,
                 object : RecognitionSupportCallback {
                     override fun onSupportResult(recognitionSupport: RecognitionSupport) {
-                        val languages = buildSet {
-                            addAll(recognitionSupport.installedOnDeviceLanguages)
-                            addAll(recognitionSupport.onlineLanguages)
-                            addAll(recognitionSupport.supportedOnDeviceLanguages)
-                        }
-                            .filter { it.isNotBlank() }
-                            .sortedBy { it.lowercase() }
-
-                        if (languages.isNotEmpty()) {
-                            debug = debug.copy(availableLanguages = languages)
+                        val installed = recognitionSupport.installedOnDeviceLanguages
+                            .filter { it.isNotBlank() }.distinct().sorted()
+                        val online = recognitionSupport.onlineLanguages
+                            .filter { it.isNotBlank() }.distinct().sorted()
+                        val supportedOffline = recognitionSupport.supportedOnDeviceLanguages
+                            .filter { it.isNotBlank() }.distinct().sorted()
+                        val all = (installed + online + supportedOffline + debug.languageTag)
+                            .filter { it.isNotBlank() }.distinct().sorted()
+                        debug = debug.copy(
+                            availableLanguages = all,
+                            installedOnDeviceLanguages = installed,
+                            onlineLanguages = online
+                        )
+                        publish()
+                        supportProbe?.destroy(); supportProbe = null
+                    }
+                    override fun onError(error: Int) {
+                        if (debug.availableLanguages.isEmpty()) {
+                            debug = debug.copy(availableLanguages = listOf(debug.languageTag))
                             publish()
                         }
-                        supportProbe?.destroy()
-                        supportProbe = null
-                    }
-
-                    override fun onError(error: Int) {
-                        supportProbe?.destroy()
-                        supportProbe = null
+                        supportProbe?.destroy(); supportProbe = null
                     }
                 }
             )
@@ -193,7 +223,6 @@ class VoiceManager(
     override fun onInit(status: Int) {
         if (status != TextToSpeech.SUCCESS) return
         ttsReady = true
-
         val voices = tts.voices.orEmpty()
             .sortedWith(compareBy<Voice>({ it.locale.displayLanguage }, { it.name }))
             .map {
@@ -205,21 +234,13 @@ class VoiceManager(
                         append(it.locale.displayName)
                         append(" • ")
                         append(it.name)
-                        if (it.isNetworkConnectionRequired) append(" • online") else append(" • offline")
+                        append(if (it.isNetworkConnectionRequired) " • online" else " • offline")
                     }
                 )
             }
-
-        val fallbackLanguages = buildSet {
-            add(Locale.getDefault().toLanguageTag())
-            addAll(tts.availableLanguages.orEmpty().map { it.toLanguageTag() })
-        }.filter { it.isNotBlank() }.sortedBy { it.lowercase() }
-
-        debug = debug.copy(
-            availableVoices = voices,
-            availableLanguages = if (debug.availableLanguages.isEmpty()) fallbackLanguages else debug.availableLanguages
-        )
-
+        val ttsLanguages = tts.availableLanguages.orEmpty()
+            .map { it.toLanguageTag() }.filter { it.isNotBlank() }.distinct().sorted()
+        debug = debug.copy(availableVoices = voices, availableTtsLanguages = ttsLanguages)
         applyTtsSettings()
         publish()
         handler.post { queryRecognitionLanguages() }
@@ -229,74 +250,75 @@ class VoiceManager(
         if (!ttsReady) return
         val locale = Locale.forLanguageTag(debug.languageTag)
         tts.language = locale
-
         val selected = tts.voices?.firstOrNull { it.name == configuredVoiceName }
             ?: tts.voices?.firstOrNull { it.locale.toLanguageTag() == debug.languageTag && !it.isNetworkConnectionRequired }
             ?: tts.voices?.firstOrNull { it.locale.language == locale.language && !it.isNetworkConnectionRequired }
-
         if (selected != null) {
             tts.voice = selected
-            if (configuredVoiceName.isBlank()) {
-                configuredVoiceName = selected.name
-                debug = debug.copy(selectedVoiceName = selected.name)
-            }
+            debug = debug.copy(
+                activeVoiceName = selected.name,
+                selectedVoiceName = if (configuredVoiceName.isBlank()) selected.name else configuredVoiceName
+            )
         }
-
         val (pitch, rate) = when (configuredPreset) {
-            "Cute" -> 1.25f to 1.05f
-            "Deep" -> 0.72f to 0.90f
-            "Tiny Bot" -> 1.42f to 1.12f
-            "Calm" -> 0.94f to 0.86f
-            "Normal" -> 1.00f to 1.00f
-            else -> 0.86f to 0.96f // Robot
+            "Cute" -> 1.18f to 1.03f
+            "Deep" -> 0.82f to 0.92f
+            "Tiny Bot" -> 1.30f to 1.08f
+            "Calm" -> 0.96f to 0.88f
+            "Robot" -> 0.90f to 0.96f
+            else -> 1.00f to 1.00f
         }
         tts.setPitch(pitch)
         tts.setSpeechRate(rate)
     }
 
-    override fun onResults(results: Bundle?) {
-        val candidates = results
-            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            .orEmpty()
-        val text = candidates.firstOrNull().orEmpty()
+    override fun onReadyForSpeech(params: Bundle?) {
+        debug = debug.copy(phase = "LISTENING")
+        publish()
+    }
 
+    override fun onBeginningOfSpeech() {
+        debug = debug.copy(phase = "HEARING")
+        publish()
+    }
+
+    override fun onEndOfSpeech() {
+        debug = debug.copy(phase = "PROCESSING")
+        publish()
+    }
+
+    override fun onResults(results: Bundle?) {
+        val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            ?.firstOrNull().orEmpty()
         debug = debug.copy(
             listening = false,
             finalText = text,
             partialText = "",
-            error = ""
+            error = "",
+            phase = if (text.isBlank()) "IDLE" else "PROCESSING"
         )
         publish()
         destroyRecognizer(cancelFirst = false)
-
-        if (text.isNotBlank()) {
-            onText(text)
-        } else {
-            fail("NO_TEXT")
-        }
+        if (text.isNotBlank()) onText(text) else fail("NO_TEXT")
     }
 
     override fun onPartialResults(partialResults: Bundle?) {
-        val text = partialResults
-            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            ?.firstOrNull()
-            .orEmpty()
-
+        val text = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            ?.firstOrNull().orEmpty()
         if (text.isNotBlank()) {
-            debug = debug.copy(partialText = text)
+            debug = debug.copy(partialText = text, phase = "HEARING")
             publish()
         }
     }
 
     override fun onError(error: Int) {
         val name = errorName(error)
-
         if ((error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) && retryCount < 1) {
             retryCount++
-            debug = debug.copy(listening = false, error = "$name • retrying")
+            debug = debug.copy(listening = false, error = "$name • retrying", phase = "RETRYING")
             publish()
             destroyRecognizer(cancelFirst = false)
-            handler.postDelayed({ startRecognizer(preferOnDevice = debug.usingOnDevice) }, 250L)
+            handler.postDelayed({ startRecognizer(preferOnDevice = debug.usingOnDevice) }, 280L)
             return
         }
 
@@ -308,22 +330,20 @@ class VoiceManager(
             SpeechRecognizer.ERROR_SERVER,
             SpeechRecognizer.ERROR_SERVER_DISCONNECTED
         )
-
         if (debug.usingOnDevice && !fallbackTried && error in fallbackErrors) {
             fallbackTried = true
-            debug = debug.copy(listening = false, error = "$name • system fallback")
+            debug = debug.copy(listening = false, error = "$name • system fallback", phase = "FALLBACK")
             publish()
             destroyRecognizer(cancelFirst = false)
-            handler.postDelayed({ startRecognizer(preferOnDevice = false) }, 250L)
+            handler.postDelayed({ startRecognizer(preferOnDevice = false) }, 280L)
             return
         }
-
         fail(name)
         destroyRecognizer(cancelFirst = false)
     }
 
     private fun fail(message: String) {
-        debug = debug.copy(listening = false, error = message)
+        debug = debug.copy(listening = false, error = message, phase = "ERROR")
         publish()
         onFailure(message)
     }
@@ -333,10 +353,7 @@ class VoiceManager(
         publish()
     }
 
-    override fun onReadyForSpeech(params: Bundle?) = Unit
-    override fun onBeginningOfSpeech() = Unit
     override fun onBufferReceived(buffer: ByteArray?) = Unit
-    override fun onEndOfSpeech() = Unit
     override fun onEvent(eventType: Int, params: Bundle?) = Unit
 
     private fun errorName(error: Int): String = when (error) {
@@ -366,9 +383,7 @@ class VoiceManager(
 
     fun shutdown() {
         destroyRecognizer(cancelFirst = true)
-        supportProbe?.destroy()
-        supportProbe = null
-        tts.stop()
-        tts.shutdown()
+        supportProbe?.destroy(); supportProbe = null
+        tts.stop(); tts.shutdown()
     }
 }

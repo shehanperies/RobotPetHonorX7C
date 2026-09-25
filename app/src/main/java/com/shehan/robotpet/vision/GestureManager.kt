@@ -13,6 +13,8 @@ import kotlin.math.sqrt
 
 data class GestureFrame(
     val gesture: HandGesture,
+    val candidate: HandGesture,
+    val stage: String,
     val confidence: Float,
     val centerX: Float,
     val centerY: Float,
@@ -21,7 +23,20 @@ data class GestureFrame(
 )
 
 private data class PathPoint(val x: Float, val y: Float, val t: Long)
+private data class HandSample(
+    val t: Long,
+    val wristX: Float,
+    val wristY: Float,
+    val indexX: Float,
+    val indexY: Float,
+    val raw: String,
+    val curl: Float
+)
 
+/**
+ * V6 gesture engine. MediaPipe handles hand detection and canned poses; dynamic gestures
+ * are confirmed from a 1-2 second landmark history before they are emitted once.
+ */
 class GestureManager(context: Context) {
     private val recognizer = GestureRecognizer.createFromOptions(
         context,
@@ -38,78 +53,91 @@ class GestureManager(context: Context) {
             .build()
     )
 
+    private val history = ArrayDeque<HandSample>()
+    private val circlePath = ArrayDeque<PathPoint>()
+    private val lastEmitted = mutableMapOf<HandGesture, Long>()
+
     private var lastInferenceMs = 0L
     private var lastFrame: GestureFrame? = null
-
-    private var lastX = 0.5f
-    private var lastY = 0.5f
-    private var lastMotionMs = 0L
-
-    private var waveStartMs = 0L
-    private var waveMinX = 1f
-    private var waveMaxX = 0f
-    private var waveMinY = 1f
-    private var waveMaxY = 0f
-    private var waveXDirection = 0
-    private var waveYDirection = 0
-    private var waveXReversals = 0
-    private var waveYReversals = 0
-
-    private var beckonStage = 0
-    private var beckonStartMs = 0L
-    private var curlState = 0
-    private var curlTransitions = 0
-    private var curlStartMs = 0L
-
-    private val circlePath = ArrayDeque<PathPoint>()
-
     private var staticCandidate = HandGesture.NONE
-    private var staticCandidateCount = 0
+    private var staticSinceMs = 0L
 
     fun analyze(bitmap: Bitmap): GestureFrame? {
         val now = System.currentTimeMillis()
-        if (now - lastInferenceMs < 105L) return lastFrame
+        if (now - lastInferenceMs < 90L) return lastFrame
         lastInferenceMs = now
 
         val result = recognizer.recognize(BitmapImageBuilder(bitmap).build())
         val landmarks = result.landmarks().firstOrNull()
-
         if (landmarks == null || landmarks.size < 21) {
-            resetDynamicIfOld(now)
-            lastFrame = null
+            trim(now)
             staticCandidate = HandGesture.NONE
-            staticCandidateCount = 0
+            staticSinceMs = 0L
+            lastFrame = null
             return null
         }
 
         val top = result.gestures().firstOrNull()?.maxByOrNull { it.score() }
-        val rawName = top?.categoryName().orEmpty().ifBlank { "None" }
-        val confidence = top?.score() ?: 0f
-
+        val raw = top?.categoryName().orEmpty().ifBlank { "None" }
+        val modelConfidence = top?.score() ?: 0f
         val wrist = landmarks[0]
-        val centerX = wrist.x()
-        val centerY = wrist.y()
+        val index = landmarks[8]
+        val curl = averageFingerExtension(landmarks)
 
-        val dynamic = detectDynamic(rawName, landmarks, centerX, centerY, now)
-        val staticGesture = classifyStatic(rawName, landmarks, confidence)
-        val stableStatic = stabilizeStatic(staticGesture)
-
-        val frame = GestureFrame(
-            gesture = dynamic ?: stableStatic,
-            confidence = confidence,
-            centerX = centerX,
-            centerY = centerY,
-            rawLabel = rawName,
-            handPresent = true
+        history.addLast(
+            HandSample(
+                t = now,
+                wristX = wrist.x(),
+                wristY = wrist.y(),
+                indexX = index.x(),
+                indexY = index.y(),
+                raw = raw,
+                curl = curl
+            )
         )
+        trim(now)
 
-        lastFrame = frame
-        return frame
+        val dynamic = detectDynamic(landmarks, raw, now)
+        val staticPose = classifyStatic(raw, landmarks, modelConfidence)
+        val stableStatic = confirmStatic(staticPose, now)
+        val candidate = dynamic ?: stableStatic
+
+        val confirmed = if (
+            candidate != HandGesture.NONE &&
+            canEmit(candidate, now)
+        ) {
+            lastEmitted[candidate] = now
+            candidate
+        } else HandGesture.NONE
+
+        val stage = when {
+            confirmed != HandGesture.NONE -> "CONFIRMED:${confirmed.name}"
+            dynamic != null -> "CANDIDATE:${dynamic.name}"
+            staticPose != HandGesture.NONE -> "HOLD:${staticPose.name}"
+            else -> "TRACKING"
+        }
+
+        val confidence = when {
+            confirmed != HandGesture.NONE -> maxOf(modelConfidence, dynamicConfidence(confirmed))
+            candidate != HandGesture.NONE -> maxOf(modelConfidence, 0.55f)
+            else -> modelConfidence
+        }
+
+        return GestureFrame(
+            gesture = confirmed,
+            candidate = candidate,
+            stage = stage,
+            confidence = confidence.coerceIn(0f, 1f),
+            centerX = wrist.x(),
+            centerY = wrist.y(),
+            rawLabel = raw,
+            handPresent = true
+        ).also { lastFrame = it }
     }
 
     private fun classifyStatic(
         name: String,
-        landmarks: List<NormalizedLandmark>,
+        l: List<NormalizedLandmark>,
         confidence: Float
     ): HandGesture {
         val direct = when (name) {
@@ -121,279 +149,214 @@ class GestureManager(context: Context) {
             "Closed_Fist" -> HandGesture.FIST
             else -> HandGesture.NONE
         }
+        if (direct != HandGesture.NONE && confidence >= 0.46f) return direct
 
-        if (direct != HandGesture.NONE && confidence >= 0.48f) return direct
-
-        // Directional pointing is derived from landmarks so a sideways finger does not
-        // depend on the model continuing to call it "Pointing_Up".
-        if (name == "Pointing_Up" || isIndexOnlyExtended(landmarks)) {
-            val mcp = landmarks[5]
-            val tip = landmarks[8]
+        if (name == "Pointing_Up" || isIndexOnlyExtended(l)) {
+            val mcp = l[5]
+            val tip = l[8]
             val dx = tip.x() - mcp.x()
             val dy = tip.y() - mcp.y()
-
             return when {
-                abs(dx) > abs(dy) * 0.68f && dx < -0.06f -> HandGesture.POINT_LEFT
-                abs(dx) > abs(dy) * 0.68f && dx > 0.06f -> HandGesture.POINT_RIGHT
-                dy > 0.075f -> HandGesture.POINT_DOWN
+                abs(dx) > abs(dy) * 0.68f && dx < -0.055f -> HandGesture.POINT_LEFT
+                abs(dx) > abs(dy) * 0.68f && dx > 0.055f -> HandGesture.POINT_RIGHT
+                dy > 0.070f -> HandGesture.POINT_DOWN
                 else -> HandGesture.POINT_UP
             }
         }
-
         return HandGesture.NONE
     }
 
-    private fun stabilizeStatic(value: HandGesture): HandGesture {
-        if (value == HandGesture.NONE) {
+    private fun confirmStatic(candidate: HandGesture, now: Long): HandGesture {
+        if (candidate == HandGesture.NONE) {
             staticCandidate = HandGesture.NONE
-            staticCandidateCount = 0
+            staticSinceMs = 0L
             return HandGesture.NONE
         }
 
-        if (value == staticCandidate) {
-            staticCandidateCount++
-        } else {
-            staticCandidate = value
-            staticCandidateCount = 1
+        if (candidate != staticCandidate) {
+            staticCandidate = candidate
+            staticSinceMs = now
+            return HandGesture.NONE
         }
 
-        // Two matching samples (~200 ms) removes most one-frame false triggers.
-        return if (staticCandidateCount >= 2) value else HandGesture.NONE
+        val required = when (candidate) {
+            HandGesture.OPEN_PALM -> 320L // STOP must be deliberate but quick
+            HandGesture.POINT_UP, HandGesture.POINT_DOWN,
+            HandGesture.POINT_LEFT, HandGesture.POINT_RIGHT -> 260L
+            else -> 300L
+        }
+        return if (now - staticSinceMs >= required) candidate else HandGesture.NONE
     }
 
     private fun detectDynamic(
-        name: String,
-        landmarks: List<NormalizedLandmark>,
-        x: Float,
-        y: Float,
+        l: List<NormalizedLandmark>,
+        raw: String,
         now: Long
     ): HandGesture? {
-        val dt = now - lastMotionMs
-        val dx = x - lastX
-        val dy = y - lastY
-        val distance = sqrt(dx * dx + dy * dy)
-        val speed = if (dt in 20L..400L) distance * 1000f / dt else 0f
+        if (history.size < 4) return null
+        val samples = history.toList()
+        val recent = samples.filter { now - it.t <= 1500L }
+        if (recent.size < 4) return null
 
-        var event: HandGesture? = null
+        val first = recent.first()
+        val last = recent.last()
+        val dt = (last.t - first.t).coerceAtLeast(1L)
+        val travel = distance(first.wristX, first.wristY, last.wristX, last.wristY)
+        val speed = travel * 1000f / dt
 
-        // A fast closed-fist trajectory is treated as a hit/swing, not a normal fist.
-        if (name == "Closed_Fist" && distance > 0.10f && speed > 1.55f) {
-            event = HandGesture.HIT_SWING
-            resetWaveBeckon()
+        // Fast closed fist -> defensive hit/swing event. It never commands an attack.
+        if (raw == "Closed_Fist" && speed > 0.95f && travel > 0.11f) {
+            return HandGesture.HIT_SWING
         }
 
-        val palmLike = name == "Open_Palm" || name == "Closed_Fist" || name == "None"
-        if (palmLike) {
-            if (waveStartMs == 0L || now - waveStartMs > 1700L) {
-                waveStartMs = now
-                waveMinX = x
-                waveMaxX = x
-                waveMinY = y
-                waveMaxY = y
-                waveXDirection = 0
-                waveYDirection = 0
-                waveXReversals = 0
-                waveYReversals = 0
-            }
+        val xRange = (recent.maxOf { it.wristX } - recent.minOf { it.wristX })
+        val yRange = (recent.maxOf { it.wristY } - recent.minOf { it.wristY })
+        val xReversals = reversals(recent.map { it.wristX }, threshold = 0.020f)
+        val yReversals = reversals(recent.map { it.wristY }, threshold = 0.020f)
+        val palmRatio = recent.count { it.raw == "Open_Palm" }.toFloat() / recent.size
 
-            waveMinX = minOf(waveMinX, x)
-            waveMaxX = maxOf(waveMaxX, x)
-            waveMinY = minOf(waveMinY, y)
-            waveMaxY = maxOf(waveMaxY, y)
+        // WAVE: open hand, mostly horizontal left-right oscillation.
+        if (
+            palmRatio >= 0.45f &&
+            xReversals >= 2 &&
+            xRange > 0.14f &&
+            xRange > yRange * 1.20f
+        ) return HandGesture.WAVE
 
-            if (abs(dx) > 0.025f) {
-                val direction = if (dx > 0f) 1 else -1
-                if (waveXDirection != 0 && direction != waveXDirection) waveXReversals++
-                waveXDirection = direction
-            }
+        // COME HERE: repeated finger curl is primary. Wrist vertical oscillation is only
+        // supporting evidence, preventing normal waving from becoming a beckon.
+        val curlTransitions = curlTransitions(recent)
+        val curlAmplitude = (recent.maxOf { it.curl } - recent.minOf { it.curl })
+        if (
+            curlTransitions >= 2 &&
+            curlAmplitude > 0.24f &&
+            (yReversals >= 1 || yRange > 0.08f)
+        ) return HandGesture.COME_HERE
 
-            if (abs(dy) > 0.025f) {
-                val direction = if (dy > 0f) 1 else -1
-                if (waveYDirection != 0 && direction != waveYDirection) waveYReversals++
-                waveYDirection = direction
-            }
+        // Secondary natural beckon: open -> fist/curled -> open within 1.5 s.
+        val sequence = recent.map { it.raw }
+        val openBefore = sequence.indexOfFirst { it == "Open_Palm" }
+        val fist = sequence.indexOfFirst { it == "Closed_Fist" }
+        val openAfter = if (fist >= 0) sequence.drop(fist + 1).indexOfFirst { it == "Open_Palm" } else -1
+        if (openBefore >= 0 && fist > openBefore && openAfter >= 0) return HandGesture.COME_HERE
 
-            val xRange = waveMaxX - waveMinX
-            val yRange = waveMaxY - waveMinY
-
-            // Horizontal oscillation -> wave. Vertical-dominant oscillation -> beckon/come here.
-            if (event == null && waveXReversals >= 2 && xRange > 0.16f && xRange > yRange * 1.25f) {
-                event = HandGesture.WAVE
-                resetWaveBeckon()
-            } else if (
-                event == null &&
-                waveYReversals >= 2 &&
-                yRange > 0.14f &&
-                yRange > xRange * 1.20f
-            ) {
-                event = HandGesture.COME_HERE
-                resetWaveBeckon()
-            }
-        } else {
-            resetWaveBeckon()
-        }
-
-        // The old open->fist->open sequence is kept as a second way to say "come here".
-        if (now - beckonStartMs > 1900L) beckonStage = 0
-        when {
-            name == "Open_Palm" && beckonStage == 0 -> {
-                beckonStage = 1
-                beckonStartMs = now
-            }
-            name == "Closed_Fist" && beckonStage == 1 -> beckonStage = 2
-            name == "Open_Palm" && beckonStage == 2 && now - beckonStartMs <= 1900L -> {
-                if (event == null) event = HandGesture.COME_HERE
-                beckonStage = 0
-            }
-        }
-
-        // Curling the fingers toward the palm and releasing twice is a natural beckon.
-        // This catches "come here" even when MediaPipe alternates between Open_Palm/None.
-        val curl = fingerCurlState(landmarks)
-        if (curl != 0) {
-            if (curlStartMs == 0L || now - curlStartMs > 2200L) {
-                curlStartMs = now
-                curlState = curl
-                curlTransitions = 0
-            } else if (curl != curlState) {
-                curlState = curl
-                curlTransitions++
-            }
-
-            if (event == null && curlTransitions >= 3) {
-                event = HandGesture.COME_HERE
-                curlStartMs = 0L
-                curlTransitions = 0
-            }
-        }
-
-        // Circle detection follows the index fingertip. It is deliberately more permissive
-        // than the static point classifier because people draw circles with slightly bent fingers.
-        if (name == "Pointing_Up" || indexLooksExtended(landmarks)) {
-            val tip = landmarks[8]
-            circlePath.addLast(PathPoint(tip.x(), tip.y(), now))
-            while (circlePath.isNotEmpty() && now - circlePath.first().t > 2800L) {
-                circlePath.removeFirst()
-            }
-
-            if (event == null && looksLikeCircle(circlePath)) {
-                event = HandGesture.TURN_AROUND
+        // TURN AROUND: draw a circle with the index tip. Both directions accepted.
+        if (raw == "Pointing_Up" || isIndexOnlyExtended(l)) {
+            circlePath.addLast(PathPoint(l[8].x(), l[8].y(), now))
+            while (circlePath.isNotEmpty() && now - circlePath.first().t > 2200L) circlePath.removeFirst()
+            if (looksLikeCircle(circlePath)) {
                 circlePath.clear()
+                return HandGesture.TURN_AROUND
             }
-        } else if (circlePath.isNotEmpty() && now - circlePath.last().t > 650L) {
+        } else if (circlePath.isNotEmpty() && now - circlePath.last().t > 550L) {
             circlePath.clear()
         }
 
-        lastX = x
-        lastY = y
-        lastMotionMs = now
-        return event
+        return null
     }
 
-    private fun isIndexOnlyExtended(l: List<NormalizedLandmark>): Boolean {
-        val wrist = l[0]
-        fun d(a: Int, b: NormalizedLandmark = wrist): Float {
-            val dx = l[a].x() - b.x()
-            val dy = l[a].y() - b.y()
-            return sqrt(dx * dx + dy * dy)
+    private fun canEmit(g: HandGesture, now: Long): Boolean {
+        val last = lastEmitted[g] ?: 0L
+        val cooldown = when (g) {
+            HandGesture.OPEN_PALM -> 900L
+            HandGesture.HIT_SWING -> 1800L
+            HandGesture.COME_HERE, HandGesture.TURN_AROUND, HandGesture.WAVE -> 2200L
+            else -> 1400L
         }
-
-        val indexExtended = d(8) > d(6) * 1.15f
-        val middleExtended = d(12) > d(10) * 1.12f
-        val ringExtended = d(16) > d(14) * 1.12f
-        val pinkyExtended = d(20) > d(18) * 1.12f
-        val otherExtended = listOf(middleExtended, ringExtended, pinkyExtended).count { it }
-
-        return indexExtended && otherExtended <= 1
+        return now - last >= cooldown
     }
 
-    private fun indexLooksExtended(l: List<NormalizedLandmark>): Boolean {
-        val wrist = l[0]
-        fun distance(a: NormalizedLandmark, b: NormalizedLandmark): Float {
-            val dx = a.x() - b.x()
-            val dy = a.y() - b.y()
-            return sqrt(dx * dx + dy * dy)
-        }
-        return distance(l[8], wrist) > distance(l[6], wrist) * 1.07f
+    private fun dynamicConfidence(g: HandGesture): Float = when (g) {
+        HandGesture.COME_HERE, HandGesture.TURN_AROUND, HandGesture.WAVE -> 0.78f
+        HandGesture.HIT_SWING -> 0.82f
+        else -> 0.65f
     }
 
-    private fun fingerCurlState(l: List<NormalizedLandmark>): Int {
-        val wrist = l[0]
-        fun d(a: Int, b: NormalizedLandmark = wrist): Float {
-            val dx = l[a].x() - b.x()
-            val dy = l[a].y() - b.y()
-            return sqrt(dx * dx + dy * dy)
-        }
+    private fun trim(now: Long) {
+        while (history.isNotEmpty() && now - history.first().t > 2200L) history.removeFirst()
+        while (circlePath.isNotEmpty() && now - circlePath.first().t > 2200L) circlePath.removeFirst()
+    }
 
-        val ratios = listOf(
+    private fun reversals(values: List<Float>, threshold: Float): Int {
+        var direction = 0
+        var count = 0
+        for (i in 1 until values.size) {
+            val delta = values[i] - values[i - 1]
+            if (abs(delta) < threshold) continue
+            val d = if (delta > 0f) 1 else -1
+            if (direction != 0 && d != direction) count++
+            direction = d
+        }
+        return count
+    }
+
+    private fun curlTransitions(samples: List<HandSample>): Int {
+        var previous = 0
+        var transitions = 0
+        for (s in samples) {
+            val state = when {
+                s.curl > 1.48f -> 1
+                s.curl < 1.24f -> -1
+                else -> 0
+            }
+            if (state == 0) continue
+            if (previous != 0 && state != previous) transitions++
+            previous = state
+        }
+        return transitions
+    }
+
+    private fun averageFingerExtension(l: List<NormalizedLandmark>): Float {
+        val wrist = l[0]
+        fun d(index: Int, to: NormalizedLandmark = wrist): Float =
+            distance(l[index].x(), l[index].y(), to.x(), to.y())
+        return listOf(
             d(8) / d(5).coerceAtLeast(0.01f),
             d(12) / d(9).coerceAtLeast(0.01f),
             d(16) / d(13).coerceAtLeast(0.01f),
             d(20) / d(17).coerceAtLeast(0.01f)
-        )
-        val avg = ratios.average().toFloat()
+        ).average().toFloat()
+    }
 
-        return when {
-            avg > 1.48f -> 1   // fingers extended
-            avg < 1.22f -> -1  // fingers curled toward palm
-            else -> 0
-        }
+    private fun isIndexOnlyExtended(l: List<NormalizedLandmark>): Boolean {
+        val wrist = l[0]
+        fun d(i: Int): Float = distance(l[i].x(), l[i].y(), wrist.x(), wrist.y())
+        val indexExtended = d(8) > d(6) * 1.12f
+        val middleExtended = d(12) > d(10) * 1.10f
+        val ringExtended = d(16) > d(14) * 1.10f
+        val pinkyExtended = d(20) > d(18) * 1.10f
+        return indexExtended && listOf(middleExtended, ringExtended, pinkyExtended).count { it } <= 1
     }
 
     private fun looksLikeCircle(path: ArrayDeque<PathPoint>): Boolean {
-        if (path.size < 9) return false
-        val points = path.toList()
-        val minX = points.minOf { it.x }
-        val maxX = points.maxOf { it.x }
-        val minY = points.minOf { it.y }
-        val maxY = points.maxOf { it.y }
+        if (path.size < 10) return false
+        val p = path.toList()
+        val width = p.maxOf { it.x } - p.minOf { it.x }
+        val height = p.maxOf { it.y } - p.minOf { it.y }
+        if (width < 0.11f || height < 0.11f) return false
+        val roundness = minOf(width, height) / maxOf(width, height)
+        if (roundness < 0.50f) return false
 
-        if (maxX - minX < 0.13f || maxY - minY < 0.13f) return false
-
-        val cx = points.map { it.x }.average().toFloat()
-        val cy = points.map { it.y }.average().toFloat()
-        var signedAngle = 0f
-        var previous = atan2(points.first().y - cy, points.first().x - cx)
-
-        for (p in points.drop(1)) {
-            val angle = atan2(p.y - cy, p.x - cx)
+        val cx = p.map { it.x }.average().toFloat()
+        val cy = p.map { it.y }.average().toFloat()
+        var angleSum = 0f
+        var previous = atan2(p.first().y - cy, p.first().x - cx)
+        for (point in p.drop(1)) {
+            val angle = atan2(point.y - cy, point.x - cx)
             var delta = angle - previous
             while (delta > Math.PI) delta -= (Math.PI * 2).toFloat()
             while (delta < -Math.PI) delta += (Math.PI * 2).toFloat()
-            signedAngle += delta
+            angleSum += delta
             previous = angle
         }
-
-        val start = points.first()
-        val end = points.last()
-        val close = sqrt(
-            (start.x - end.x) * (start.x - end.x) +
-                (start.y - end.y) * (start.y - end.y)
-        ) < 0.26f
-
-        return close && abs(signedAngle) > 4.35f
+        val closed = distance(p.first().x, p.first().y, p.last().x, p.last().y) < maxOf(width, height) * 0.85f
+        return closed && abs(angleSum) > 4.7f
     }
 
-    private fun resetDynamicIfOld(now: Long) {
-        if (now - lastMotionMs > 900L) {
-            resetWaveBeckon()
-            beckonStage = 0
-            curlStartMs = 0L
-            curlTransitions = 0
-            circlePath.clear()
-        }
-    }
-
-    private fun resetWaveBeckon() {
-        waveStartMs = 0L
-        waveMinX = 1f
-        waveMaxX = 0f
-        waveMinY = 1f
-        waveMaxY = 0f
-        waveXDirection = 0
-        waveYDirection = 0
-        waveXReversals = 0
-        waveYReversals = 0
+    private fun distance(x1: Float, y1: Float, x2: Float, y2: Float): Float {
+        val dx = x1 - x2
+        val dy = y1 - y2
+        return sqrt(dx * dx + dy * dy)
     }
 
     fun close() = recognizer.close()

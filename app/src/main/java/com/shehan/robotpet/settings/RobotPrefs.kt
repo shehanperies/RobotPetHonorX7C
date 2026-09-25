@@ -9,7 +9,6 @@ class RobotPrefs(context: Context) {
         get() = p.getString("robot_url", "ws://192.168.4.1/ws") ?: "ws://192.168.4.1/ws"
         set(value) = p.edit().putString("robot_url", value.trim()).apply()
 
-    // Permission to follow after an explicit command/gesture/AI decision, not always-on following.
     var followEnabled: Boolean
         get() = p.getBoolean("follow_enabled", true)
         set(value) = p.edit().putBoolean("follow_enabled", value).apply()
@@ -23,8 +22,30 @@ class RobotPrefs(context: Context) {
         set(value) = p.edit().putString("voice_name", value).apply()
 
     var voicePreset: String
-        get() = p.getString("voice_preset", "Robot") ?: "Robot"
+        get() = p.getString("voice_preset", "Normal") ?: "Normal"
         set(value) = p.edit().putString("voice_preset", value).apply()
+
+    var robotName: String
+        get() = p.getString("robot_name", "Milo") ?: "Milo"
+        set(value) = p.edit().putString("robot_name", value.trim().ifBlank { "Milo" }).apply()
+
+    var ownerName: String
+        get() = p.getString("owner_name", "") ?: ""
+        set(value) = p.edit().putString("owner_name", value.trim()).apply()
+
+    var characterInstructions: String
+        get() = p.getString(
+            "character_instructions",
+            "Curious, playful, affectionate and independent. Short natural replies. Sometimes self-play, sometimes quietly observe."
+        ) ?: "Curious, playful, affectionate and independent."
+        set(value) = p.edit().putString("character_instructions", value.trim()).apply()
+
+    var characterNeverDo: String
+        get() = p.getString(
+            "character_never_do",
+            "Never be aggressive, never nag repeatedly, never claim a physical action happened unless the local executor confirmed it."
+        ) ?: "Never be aggressive."
+        set(value) = p.edit().putString("character_never_do", value.trim()).apply()
 
     var geminiEnabled: Boolean
         get() = p.getBoolean("gemini_enabled", false)
@@ -65,4 +86,12 @@ class RobotPrefs(context: Context) {
     var energy: Int
         get() = p.getInt("energy", 90)
         set(value) = p.edit().putInt("energy", value.coerceIn(0, 100)).apply()
+
+    var affection: Int
+        get() = p.getInt("affection", 50)
+        set(value) = p.edit().putInt("affection", value.coerceIn(0, 100)).apply()
+
+    var confidence: Int
+        get() = p.getInt("confidence", 50)
+        set(value) = p.edit().putInt("confidence", value.coerceIn(0, 100)).apply()
 }

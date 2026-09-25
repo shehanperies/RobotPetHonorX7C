@@ -12,18 +12,15 @@ android {
         applicationId = "com.shehan.robotpet"
         minSdk = 26
         targetSdk = 36
-        versionCode = 5
-        versionName = "0.5.0"
+        versionCode = 6
+        versionName = "0.6.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
 

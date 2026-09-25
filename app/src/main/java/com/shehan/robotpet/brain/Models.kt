@@ -1,7 +1,7 @@
 package com.shehan.robotpet.brain
 
 enum class Emotion {
-    IDLE, HAPPY, CURIOUS, LISTENING, SLEEPY, STARTLED, SAD,
+    IDLE, HAPPY, CURIOUS, LISTENING, THINKING, SPEAKING, SLEEPY, STARTLED, SAD,
     ANGRY, PLAYFUL, LOVE, DIZZY, LONELY
 }
 
@@ -33,11 +33,33 @@ enum class PhoneEvent {
 }
 
 enum class PetMode {
-    IDLE, ENGAGED, FOLLOWING, SEARCHING, LISTENING, SLEEPING, REMOTE, THINKING
+    IDLE, ENGAGED, FOLLOWING, SEARCHING, LISTENING, CONVERSATION,
+    OBJECT_PLAY, SLEEPING, REMOTE, THINKING, EMERGENCY
 }
 
 enum class AiAction {
-    NONE, CHAT, GREET, PLAY, SEARCH, FOLLOW, LOOK_LEFT, LOOK_RIGHT, FORK_WAVE, REST
+    NONE, CHAT, GREET, PLAY, SEARCH, FOLLOW, LOOK_LEFT, LOOK_RIGHT,
+    FORK_WAVE, REST, INSPECT_OBJECT
+}
+
+enum class DecisionSource {
+    SAFETY,
+    REMOTE,
+    DIRECT_COMMAND,
+    LISTENING,
+    GESTURE,
+    TOUCH,
+    FOLLOW,
+    SEARCH,
+    VISION,
+    PHONE,
+    BATTERY,
+    AI,
+    IDLE
+}
+
+enum class BehaviorResource {
+    DRIVE, FORK, FACE, SPEECH, MIC
 }
 
 data class AiDirective(
@@ -54,6 +76,8 @@ data class PetMindSnapshot(
     val boredom: Int = 0,
     val curiosity: Int = 0,
     val energy: Int = 100,
+    val affection: Int = 50,
+    val confidence: Int = 50,
     val followActive: Boolean = false,
     val searchActive: Boolean = false
 )
@@ -62,6 +86,15 @@ data class MotionStep(
     val command: MotionCommand,
     val durationMs: Long,
     val delayAfterMs: Long = 80L
+)
+
+data class DetectedObject(
+    val trackId: Int = 0,
+    val label: String,
+    val confidence: Float,
+    val centerX: Float,
+    val centerY: Float,
+    val areaRatio: Float
 )
 
 data class VisionObservation(
@@ -75,7 +108,11 @@ data class VisionObservation(
     val headEulerX: Float = 0f,
     val headEulerY: Float = 0f,
     val headEulerZ: Float = 0f,
+    val kissConfidence: Float = 0f,
+    val kissDetected: Boolean = false,
+    val blownKissDetected: Boolean = false,
 
+    val objects: List<DetectedObject> = emptyList(),
     val objectCount: Int = 0,
     val objectCenterX: Float = 0.5f,
     val objectCenterY: Float = 0.5f,
@@ -86,6 +123,8 @@ data class VisionObservation(
     val handPresent: Boolean = false,
     val rawHandLabel: String = "",
     val handGesture: HandGesture = HandGesture.NONE,
+    val handCandidate: HandGesture = HandGesture.NONE,
+    val gestureStage: String = "NONE",
     val handConfidence: Float = 0f,
     val handCenterX: Float = 0.5f,
     val handCenterY: Float = 0.5f,
@@ -106,6 +145,9 @@ data class RobotTelemetry(
     val connected: Boolean = false,
     val safeToMove: Boolean = false,
     val obstacleCm: Float? = null,
+    val leftCm: Float? = null,
+    val centerCm: Float? = null,
+    val rightCm: Float? = null,
     val batteryPercent: Int? = null,
     val lastSeenMs: Long = 0L
 )
@@ -120,5 +162,7 @@ data class BrainDecision(
     val motionDurationMs: Long = 0L,
     val sequence: List<MotionStep> = emptyList(),
     val interruptMotion: Boolean = false,
-    val status: String = "Idle"
+    val status: String = "Idle",
+    val behaviorKey: String = "idle",
+    val minimumHoldMs: Long = 0L
 )

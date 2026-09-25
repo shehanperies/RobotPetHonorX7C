@@ -1,0 +1,9 @@
+UPLOAD THIS ZIP TO THE ROOT OF RobotPetHonorX7C, THEN IN CODESPACES TERMINAL RUN:
+
+unzip -o RobotPetHonorX7C-V6-Patch.zip
+rm RobotPetHonorX7C-V6-Patch.zip
+git add -A
+git commit -m "Add V6 central living pet brain"
+git push
+
+The ZIP is an overlay: it replaces only the listed V5 files and adds the new BehaviorExecutive + V6 tests/notes.
