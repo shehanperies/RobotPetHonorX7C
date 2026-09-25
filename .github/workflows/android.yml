@@ -22,6 +22,11 @@ jobs:
         run: |
           yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null || true
           /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+      - name: Download MediaPipe gesture model
+        run: |
+          mkdir -p app/src/main/assets
+          curl -L --fail --retry 3 "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task" -o app/src/main/assets/gesture_recognizer.task
+          test -s app/src/main/assets/gesture_recognizer.task
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.13'
@@ -31,6 +36,6 @@ jobs:
         run: gradle --no-daemon :app:assembleDebug
       - uses: actions/upload-artifact@v4
         with:
-          name: RobotPetHonorX7C-debug-apk
+          name: RobotPetHonorX7C-v2-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

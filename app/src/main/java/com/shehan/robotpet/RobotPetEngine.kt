@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.lifecycle.LifecycleOwner
 import com.shehan.robotpet.brain.BrainDecision
 import com.shehan.robotpet.brain.Emotion
+import com.shehan.robotpet.brain.HandGesture
 import com.shehan.robotpet.brain.MotionCommand
 import com.shehan.robotpet.brain.PetBrain
 import com.shehan.robotpet.brain.RobotTelemetry
@@ -15,8 +16,8 @@ import com.shehan.robotpet.voice.VoiceManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
@@ -32,11 +33,25 @@ data class PetUiState(
     val robotConnected: Boolean = false,
     val safeToMove: Boolean = false,
     val obstacleCm: Float? = null,
-    val lastHeard: String = ""
+    val lastHeard: String = "",
+
+    val lastGesture: HandGesture = HandGesture.NONE,
+    val decisionCommand: MotionCommand = MotionCommand.STOP,
+    val espRequestedCommand: MotionCommand = MotionCommand.STOP,
+    val espActualCommand: MotionCommand? = null,
+    val espDurationMs: Long = 0L,
+    val espQueued: Boolean = false,
+    val espSafetyBlocked: Boolean = false,
+    val espLastTxMs: Long = 0L
 )
 
-class RobotPetEngine(private val context: Context) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+class RobotPetEngine(
+    private val context: Context
+) {
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Main.immediate
+    )
+
     private val brain = PetBrain()
     private val link = RobotLink()
     private val prefs = RobotPrefs(context)
@@ -53,56 +68,141 @@ class RobotPetEngine(private val context: Context) {
             dispatch(brain.onSpeech(text, telemetry))
         },
         onListeningChanged = { listening ->
-            _ui.value = _ui.value.copy(listening = listening, emotion = if (listening) Emotion.LISTENING else _ui.value.emotion)
+            _ui.value = _ui.value.copy(
+                listening = listening,
+                emotion = if (listening) {
+                    Emotion.LISTENING
+                } else {
+                    _ui.value.emotion
+                }
+            )
         }
     )
 
     init {
         brain.setFollowEnabled(prefs.followEnabled)
+
         scope.launch {
             link.telemetry.collectLatest { t ->
                 telemetry = t
-                _ui.value = _ui.value.copy(robotConnected = t.connected, safeToMove = t.safeToMove, obstacleCm = t.obstacleCm)
+                _ui.value = _ui.value.copy(
+                    robotConnected = t.connected,
+                    safeToMove = t.safeToMove,
+                    obstacleCm = t.obstacleCm
+                )
             }
         }
+
+        scope.launch {
+            link.debug.collectLatest { d ->
+                _ui.value = _ui.value.copy(
+                    espRequestedCommand = d.requested,
+                    espActualCommand = d.actual,
+                    espDurationMs = d.durationMs,
+                    espQueued = d.queuedToWebSocket,
+                    espSafetyBlocked = d.blockedBySafety,
+                    espLastTxMs = d.sentAtMs
+                )
+            }
+        }
+
         scope.launch {
             while (isActive) {
                 delay(2500)
-                dispatch(brain.idleTick(telemetry), speak = false)
+                dispatch(
+                    brain.idleTick(telemetry),
+                    speak = false
+                )
             }
         }
     }
 
     fun startVision(owner: LifecycleOwner) {
         if (vision != null) return
-        vision = VisionManager(context) { observation -> scope.launch { onVision(observation) } }
+
+        vision = VisionManager(context) { observation ->
+            scope.launch {
+                onVision(observation)
+            }
+        }
+
         vision?.start(owner)
     }
 
-    fun connectRobot() = link.connect(prefs.robotUrl)
-    fun disconnectRobot() = link.disconnect()
-    fun listen() = voice.listen()
-    fun touch() = dispatch(brain.onTouch())
+    fun connectRobot() {
+        link.connect(prefs.robotUrl)
+    }
 
-    fun updateSettings(url: String, follow: Boolean) {
+    fun disconnectRobot() {
+        link.disconnect()
+    }
+
+    fun listen() {
+        voice.listen()
+    }
+
+    fun touch() {
+        dispatch(brain.onTouch())
+    }
+
+    fun updateSettings(
+        url: String,
+        follow: Boolean
+    ) {
         prefs.robotUrl = url
         prefs.followEnabled = follow
         brain.setFollowEnabled(follow)
         link.disconnect()
-        if (url.isNotBlank()) link.connect(url)
+
+        if (url.isNotBlank()) {
+            link.connect(url)
+        }
     }
 
     fun currentRobotUrl(): String = prefs.robotUrl
+
     fun currentFollowEnabled(): Boolean = prefs.followEnabled
 
     private fun onVision(v: VisionObservation) {
-        dispatch(brain.onVision(v, telemetry), speak = false)
+        _ui.value = _ui.value.copy(
+            lastGesture = v.handGesture
+        )
+
+        // Gesture reactions may contain one-shot speech.
+        dispatch(
+            brain.onVision(v, telemetry),
+            speak = true
+        )
     }
 
-    private fun dispatch(d: BrainDecision, speak: Boolean = true) {
-        _ui.value = _ui.value.copy(emotion = d.emotion, gazeX = d.gazeX, gazeY = d.gazeY, status = d.status)
-        if (d.motion != MotionCommand.STOP || telemetry.connected) link.send(d.motion, d.motionDurationMs)
-        if (speak && !d.speech.isNullOrBlank()) voice.speak(d.speech)
+    private fun dispatch(
+        d: BrainDecision,
+        speak: Boolean = true
+    ) {
+        _ui.value = _ui.value.copy(
+            emotion = d.emotion,
+            gazeX = d.gazeX,
+            gazeY = d.gazeY,
+            status = d.status,
+            decisionCommand = d.motion
+        )
+
+        if (
+            d.motion != MotionCommand.STOP ||
+            telemetry.connected
+        ) {
+            link.send(
+                d.motion,
+                d.motionDurationMs
+            )
+        }
+
+        if (
+            speak &&
+            !d.speech.isNullOrBlank()
+        ) {
+            voice.speak(d.speech)
+        }
     }
 
     fun shutdown() {
