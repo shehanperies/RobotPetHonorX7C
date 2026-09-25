@@ -17,9 +17,14 @@ data class ExecutiveResult(
 )
 
 /**
- * V7 coordinator. The important change is PRIMARY: only one meaningful behavior owns the
- * robot at a time. Vision may keep tracking in the background, but it cannot start another
- * reaction until the current behavior finishes unless a higher-priority source preempts it.
+ * V8 foreground-behavior coordinator.
+ *
+ * Rules:
+ *  - exactly one meaningful PRIMARY behavior at a time;
+ *  - TTS is an output of a behavior, never a PRIMARY behavior itself;
+ *  - low-priority interruptMotion can NOT punch through a higher-priority behavior;
+ *  - while TTS is speaking, passive/vision/idle events are dropped instead of queued;
+ *  - safety/manual/user commands may preempt lower-priority autonomous work.
  */
 class BehaviorExecutive {
     private val leases = mutableMapOf<BehaviorResource, ResourceLease>()
@@ -31,9 +36,9 @@ class BehaviorExecutive {
 
     fun setListening(active: Boolean, now: Long = System.currentTimeMillis()) {
         listening = active
-        clearOwned(DecisionSource.LISTENING)
+        leases.entries.removeAll { it.value.source == DecisionSource.LISTENING }
         if (active) {
-            val lease = ResourceLease(DecisionSource.LISTENING, 82, "listening", Long.MAX_VALUE)
+            val lease = ResourceLease(DecisionSource.LISTENING, priorityOf(DecisionSource.LISTENING), "listening", Long.MAX_VALUE)
             leases[BehaviorResource.PRIMARY] = lease
             leases[BehaviorResource.MIC] = lease
             leases[BehaviorResource.SPEECH] = lease
@@ -43,23 +48,17 @@ class BehaviorExecutive {
         expire(now)
     }
 
+    /** Speaking does not replace PRIMARY. It only blocks new low-priority reactions. */
     fun setSpeaking(active: Boolean, now: Long = System.currentTimeMillis()) {
         speaking = active
-        leases.entries.removeAll { it.value.behaviorKey == "tts-speaking" }
-        if (active && !listening) {
-            val lease = ResourceLease(DecisionSource.LISTENING, 78, "tts-speaking", Long.MAX_VALUE)
-            val current = leases[BehaviorResource.PRIMARY]
-            if (current == null || current.priority <= lease.priority) leases[BehaviorResource.PRIMARY] = lease
-            leases[BehaviorResource.SPEECH] = lease
-        }
         expire(now)
     }
 
     fun setRemoteManual(active: Boolean, now: Long = System.currentTimeMillis()) {
         remoteManual = active
-        clearOwned(DecisionSource.REMOTE)
+        leases.entries.removeAll { it.value.source == DecisionSource.REMOTE }
         if (active) {
-            val lease = ResourceLease(DecisionSource.REMOTE, 90, "remote", Long.MAX_VALUE)
+            val lease = ResourceLease(DecisionSource.REMOTE, priorityOf(DecisionSource.REMOTE), "remote", Long.MAX_VALUE)
             leases[BehaviorResource.PRIMARY] = lease
             leases[BehaviorResource.DRIVE] = lease
             leases[BehaviorResource.FORK] = lease
@@ -77,6 +76,11 @@ class BehaviorExecutive {
         return leases[BehaviorResource.PRIMARY]?.behaviorKey ?: "idle"
     }
 
+    fun complete(behaviorKey: String, now: Long = System.currentTimeMillis()) {
+        leases.entries.removeAll { it.value.behaviorKey == behaviorKey && it.value.untilMs != Long.MAX_VALUE }
+        expire(now)
+    }
+
     fun submit(decision: BrainDecision, source: DecisionSource, now: Long = System.currentTimeMillis()): ExecutiveResult {
         expire(now)
         val key = decision.behaviorKey.ifBlank { source.name.lowercase() }
@@ -86,26 +90,46 @@ class BehaviorExecutive {
         val denied = linkedSetOf<BehaviorResource>()
         val preempted = linkedSetOf<BehaviorResource>()
 
-        val hardStop = source == DecisionSource.SAFETY || decision.interruptMotion
-        if (hardStop) {
-            val primary = leases[BehaviorResource.PRIMARY]
-            if (primary != null && primary.behaviorKey != key) preempted += BehaviorResource.PRIMARY
-            listOf(BehaviorResource.PRIMARY, BehaviorResource.DRIVE, BehaviorResource.FORK).forEach {
-                if (leases.containsKey(it)) preempted += it
-                leases.remove(it)
-                allowed += it
+        val currentPrimary = leases[BehaviorResource.PRIMARY]
+        val primaryRequested = BehaviorResource.PRIMARY in requested
+
+        // Speech is a child output. While it is active, vision/idle/AI chatter is stale noise.
+        if (speaking && primaryRequested && priority < priorityOf(DecisionSource.DIRECT_COMMAND) &&
+            source !in setOf(DecisionSource.SAFETY, DecisionSource.REMOTE)) {
+            denied += requested.filter { it != BehaviorResource.FACE }
+            if (BehaviorResource.FACE in requested) allowed += BehaviorResource.FACE
+            return result(decision, source, allowed, preempted, denied, now)
+        }
+
+        // Safety always wins. interruptMotion only preempts if this source is actually allowed to
+        // beat the current behavior. This closes the V7 low-priority interrupt loophole.
+        val safety = source == DecisionSource.SAFETY
+        val mayPreemptPrimary = currentPrimary == null || currentPrimary.behaviorKey == key ||
+            priority > currentPrimary.priority || (source == DecisionSource.REMOTE && remoteManual)
+
+        if (safety) {
+            for (r in listOf(BehaviorResource.PRIMARY, BehaviorResource.DRIVE, BehaviorResource.FORK)) {
+                if (leases.containsKey(r)) preempted += r
+                leases.remove(r)
+                allowed += r
+            }
+        } else if (decision.interruptMotion && mayPreemptPrimary) {
+            for (r in listOf(BehaviorResource.PRIMARY, BehaviorResource.DRIVE, BehaviorResource.FORK)) {
+                val current = leases[r]
+                if (current != null && current.behaviorKey != key) preempted += r
+                leases.remove(r)
             }
         }
 
-        val currentPrimary = leases[BehaviorResource.PRIMARY]
-        val primaryRequested = BehaviorResource.PRIMARY in requested
-        val samePrimary = currentPrimary?.behaviorKey == key
+        val primaryAfterInterrupt = leases[BehaviorResource.PRIMARY]
+        val samePrimary = primaryAfterInterrupt?.behaviorKey == key
         val canTakePrimary = when {
             !primaryRequested -> true
             BehaviorResource.PRIMARY in allowed -> true
-            currentPrimary == null -> true
+            primaryAfterInterrupt == null -> true
             samePrimary -> true
-            priority > currentPrimary.priority -> true
+            priority > primaryAfterInterrupt.priority -> true
+            source == DecisionSource.REMOTE && remoteManual -> true
             else -> false
         }
 
@@ -121,13 +145,15 @@ class BehaviorExecutive {
                 if (canUse) {
                     if (current != null && current.behaviorKey != key) preempted += resource
                     allowed += resource
-                } else denied += resource
+                } else {
+                    denied += resource
+                }
             }
         }
 
-        // Do not restart the same reaction from repeated detector frames. Follow/search are
-        // continuous controllers, so they are intentionally exempt from this restart guard.
-        val duplicateWindow = maxOf(900L, decision.minimumHoldMs.coerceAtMost(3000L))
+        // Same event repeated by detector frames may update FACE only. FOLLOW/SEARCH are continuous
+        // controllers and need repeated drive pulses, so they are exempt.
+        val duplicateWindow = maxOf(1100L, decision.minimumHoldMs.coerceAtMost(4500L))
         val duplicate = key == lastStartedKey && now - lastStartedMs < duplicateWindow
         if (duplicate && source !in setOf(DecisionSource.SAFETY, DecisionSource.REMOTE, DecisionSource.FOLLOW, DecisionSource.SEARCH)) {
             denied += allowed.filter { it != BehaviorResource.FACE }
@@ -135,10 +161,13 @@ class BehaviorExecutive {
         }
 
         val hold = if (decision.minimumHoldMs > 0L) decision.minimumHoldMs else defaultHoldMs(source, decision)
+        val speechHold = if (!decision.speech.isNullOrBlank()) maxOf(hold, 3200L) else hold
         for (resource in allowed) {
             val until = when {
-                resource == BehaviorResource.FACE && source in setOf(DecisionSource.VISION, DecisionSource.FOLLOW, DecisionSource.SEARCH) -> now + 300L
+                resource == BehaviorResource.FACE && source in setOf(DecisionSource.VISION, DecisionSource.FOLLOW, DecisionSource.SEARCH) -> now + 350L
                 source == DecisionSource.REMOTE && remoteManual -> Long.MAX_VALUE
+                source == DecisionSource.LISTENING && listening -> Long.MAX_VALUE
+                resource == BehaviorResource.PRIMARY -> now + speechHold
                 else -> now + hold
             }
             leases[resource] = ResourceLease(source, priority, key, until)
@@ -149,6 +178,33 @@ class BehaviorExecutive {
             lastStartedMs = now
         }
 
+        return result(decision, source, allowed, preempted, denied, now)
+    }
+
+    fun activeLocks(now: Long = System.currentTimeMillis()): String {
+        expire(now)
+        if (leases.isEmpty()) return "none"
+        return leases.entries.sortedBy { it.key.name }
+            .joinToString(",") { (r, l) -> "${r.name}:${l.behaviorKey}" }
+    }
+
+    fun reset() {
+        leases.clear()
+        listening = false
+        speaking = false
+        remoteManual = false
+        lastStartedKey = ""
+        lastStartedMs = 0L
+    }
+
+    private fun result(
+        decision: BrainDecision,
+        source: DecisionSource,
+        allowed: Set<BehaviorResource>,
+        preempted: Set<BehaviorResource>,
+        denied: Set<BehaviorResource>,
+        now: Long
+    ): ExecutiveResult {
         val filtered = decision.copy(
             speech = if (BehaviorResource.SPEECH in allowed) decision.speech else null,
             motion = if (
@@ -170,31 +226,14 @@ class BehaviorExecutive {
             interruptMotion = decision.interruptMotion &&
                 (BehaviorResource.DRIVE in allowed || BehaviorResource.FORK in allowed)
         )
-
         return ExecutiveResult(
             decision = filtered,
             source = source,
             allowed = allowed,
             preempted = preempted,
             denied = denied,
-            summary = "${source.name}:$key • ${activeLocks(now)}"
+            summary = "${source.name}:${decision.behaviorKey} • ${activeLocks(now)}"
         )
-    }
-
-    fun activeLocks(now: Long = System.currentTimeMillis()): String {
-        expire(now)
-        if (leases.isEmpty()) return "none"
-        return leases.entries.sortedBy { it.key.name }
-            .joinToString(",") { (r, l) -> "${r.name}:${l.behaviorKey}" }
-    }
-
-    fun reset() {
-        leases.clear()
-        listening = false
-        speaking = false
-        remoteManual = false
-        lastStartedKey = ""
-        lastStartedMs = 0L
     }
 
     private fun requestedResources(d: BrainDecision, source: DecisionSource): Set<BehaviorResource> = buildSet {
@@ -214,14 +253,9 @@ class BehaviorExecutive {
         if (d.sequence.any { it.command in forkCommands }) add(BehaviorResource.FORK)
     }
 
-    private fun clearOwned(source: DecisionSource) {
-        leases.entries.removeAll { it.value.source == source }
-    }
-
     private fun expire(now: Long) {
         leases.entries.removeAll { it.value.untilMs != Long.MAX_VALUE && it.value.untilMs <= now }
-        if (!listening) leases.entries.removeAll { it.value.source == DecisionSource.LISTENING && it.value.behaviorKey == "listening" }
-        if (!speaking) leases.entries.removeAll { it.value.behaviorKey == "tts-speaking" }
+        if (!listening) leases.entries.removeAll { it.value.source == DecisionSource.LISTENING }
         if (!remoteManual) leases.entries.removeAll { it.value.source == DecisionSource.REMOTE }
     }
 
@@ -242,19 +276,19 @@ class BehaviorExecutive {
     }
 
     private fun defaultHoldMs(source: DecisionSource, d: BrainDecision): Long = when (source) {
-        DecisionSource.SAFETY -> 1000L
+        DecisionSource.SAFETY -> 1200L
         DecisionSource.REMOTE -> 1200L
-        DecisionSource.DIRECT_COMMAND -> maxOf(1700L, sequenceLength(d))
+        DecisionSource.DIRECT_COMMAND -> maxOf(1800L, sequenceLength(d))
         DecisionSource.LISTENING -> 2500L
-        DecisionSource.GESTURE -> maxOf(1900L, sequenceLength(d))
-        DecisionSource.TOUCH -> maxOf(1700L, sequenceLength(d))
-        DecisionSource.FOLLOW -> 700L
+        DecisionSource.GESTURE -> maxOf(2000L, sequenceLength(d))
+        DecisionSource.TOUCH -> maxOf(1800L, sequenceLength(d))
+        DecisionSource.FOLLOW -> 800L
         DecisionSource.SEARCH -> 1000L
-        DecisionSource.VISION -> if (d.speech != null || d.sequence.isNotEmpty()) maxOf(1800L, sequenceLength(d)) else 300L
-        DecisionSource.PHONE -> 1600L
-        DecisionSource.BATTERY -> 1800L
-        DecisionSource.AI -> 2400L
-        DecisionSource.IDLE -> if (d.sequence.isNotEmpty()) maxOf(1800L, sequenceLength(d)) else 600L
+        DecisionSource.VISION -> if (d.speech != null || d.sequence.isNotEmpty()) maxOf(2200L, sequenceLength(d)) else 450L
+        DecisionSource.PHONE -> 1800L
+        DecisionSource.BATTERY -> 2200L
+        DecisionSource.AI -> 2600L
+        DecisionSource.IDLE -> if (d.sequence.isNotEmpty()) maxOf(2200L, sequenceLength(d)) else 800L
     }
 
     private fun sequenceLength(d: BrainDecision): Long =

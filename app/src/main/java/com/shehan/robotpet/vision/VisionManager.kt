@@ -3,6 +3,7 @@ package com.shehan.robotpet.vision
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.os.SystemClock
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -15,11 +16,18 @@ import com.google.mlkit.vision.face.FaceContour
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import com.shehan.robotpet.brain.HandGesture
+import com.shehan.robotpet.brain.OneShotEventGate
 import com.shehan.robotpet.brain.VisionObservation
 import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.sqrt
 
+private data class FaceAreaSample(val t: Long, val area: Float)
+
+/**
+ * V8 perception layer. Raw measurements are continuous, but semantic events are one-shot.
+ * In particular, kiss/close-face events must be released before they can ever fire again.
+ */
 class VisionManager(
     private val context: Context,
     private val onObservation: (VisionObservation) -> Unit,
@@ -28,25 +36,36 @@ class VisionManager(
     private val executor = Executors.newSingleThreadExecutor()
     private var provider: ProcessCameraProvider? = null
     private var usingFrontCamera = true
+    private var lastAnalyzeMono = 0L
 
     private val gestureManager = GestureManager(context)
     private val objectManager = ObjectDetectorManager(context)
 
+    // Contours are required for the adaptive pucker signal. Tracking is intentionally disabled:
+    // with contour mode ML Kit only returns the prominent face and tracking adds no value.
     private val faceDetector = FaceDetection.getClient(
         FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
             .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
             .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
-            .enableTracking()
             .setMinFaceSize(0.12f)
             .build()
     )
 
-    private var kissCandidateSinceMs = 0L
-    private var lastKissMs = 0L
-    private var handNearMouthMs = 0L
+    private val kissGate = OneShotEventGate(confirmMs = 700L, releaseMs = 700L, minimumGapMs = 1800L)
+    private var puckerBaseline = 0f
+    private var baselineSamples = 0
+    private var faceSeenSinceMono = 0L
+    private var lastFaceSeenMono = 0L
+
+    private var handNearMouthMono = 0L
     private var previousHandFaceDistance = 9f
-    private var lastBlownKissMs = 0L
+    private var blownLatched = false
+    private var blownReleaseSince = 0L
+
+    private val areaHistory = ArrayDeque<FaceAreaSample>()
+    private var closeLatched = false
+    private var closeReleaseSince = 0L
 
     fun start(owner: LifecycleOwner) {
         val future = ProcessCameraProvider.getInstance(context)
@@ -65,14 +84,21 @@ class VisionManager(
             }
             if (front.isFailure) {
                 usingFrontCamera = false
-                runCatching {
-                    provider?.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, analysis)
-                }
+                runCatching { provider?.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, analysis) }
             }
         }, ContextCompat.getMainExecutor(context))
     }
 
     private fun analyze(proxy: ImageProxy) {
+        val monoNow = SystemClock.elapsedRealtime()
+        // Face/gesture perception at ~9 Hz is enough for a pet reaction engine and avoids
+        // processing a backlog of nearly identical frames.
+        if (monoNow - lastAnalyzeMono < 105L) {
+            proxy.close()
+            return
+        }
+        lastAnalyzeMono = monoNow
+
         val plane = proxy.planes[0]
         val buffer = plane.buffer
         buffer.rewind()
@@ -91,13 +117,13 @@ class VisionManager(
             Bitmap.createBitmap(rotated, 0, 0, rotated.width, rotated.height, mirror, true)
         } else rotated
 
-        val now = System.currentTimeMillis()
+        val wallNow = System.currentTimeMillis()
         runCatching { onFrame?.invoke(bitmap) }
         val width = bitmap.width.toFloat().coerceAtLeast(1f)
         val height = bitmap.height.toFloat().coerceAtLeast(1f)
 
         val gesture = runCatching { gestureManager.analyze(bitmap) }.getOrNull()
-        val objects = runCatching { objectManager.analyze(bitmap, now) }.getOrDefault(ObjectFrame())
+        val objects = runCatching { objectManager.analyze(bitmap, wallNow) }.getOrDefault(ObjectFrame())
         val input = InputImage.fromBitmap(bitmap, 0)
 
         faceDetector.process(input)
@@ -113,9 +139,10 @@ class VisionManager(
                 var eulerX = 0f
                 var eulerY = 0f
                 var eulerZ = 0f
-                var kissConfidence = 0f
+                var adaptiveKissConfidence = 0f
                 var kissDetected = false
                 var blownKiss = false
+                var closeApproach = false
 
                 if (face != null) {
                     faceVisible = true
@@ -129,55 +156,88 @@ class VisionManager(
                     eulerY = face.headEulerAngleY
                     eulerZ = face.headEulerAngleZ
 
-                    kissConfidence = kissScore(face)
-                    val puckerCandidate = kissConfidence >= 0.70f && smile < 0.55f && abs(eulerY) < 24f
-                    if (puckerCandidate) {
-                        if (kissCandidateSinceMs == 0L) kissCandidateSinceMs = now
-                        if (now - kissCandidateSinceMs >= 420L && now - lastKissMs > 3200L) {
-                            kissDetected = true
-                            lastKissMs = now
-                            kissCandidateSinceMs = now
-                        }
-                    } else {
-                        kissCandidateSinceMs = 0L
+                    if (faceSeenSinceMono == 0L || monoNow - lastFaceSeenMono > 1200L) {
+                        faceSeenSinceMono = monoNow
+                        baselineSamples = 0
+                        puckerBaseline = 0f
+                        areaHistory.clear()
                     }
+                    lastFaceSeenMono = monoNow
+
+                    val rawPucker = puckerScore(face)
+                    if (baselineSamples == 0) {
+                        puckerBaseline = rawPucker
+                        baselineSamples = 1
+                    }
+                    val faceStable = monoNow - faceSeenSinceMono >= 1400L
+                    val baselineReady = faceStable && baselineSamples >= 9
+                    val threshold = maxOf(0.80f, puckerBaseline + 0.17f).coerceAtMost(0.98f)
+                    val frontal = abs(eulerY) < 23f && abs(eulerX) < 20f
+                    val puckerActive = baselineReady && frontal && smile < 0.52f && rawPucker >= threshold
+
+                    // Learn the person's normal mouth shape only while clearly not trying to pucker.
+                    if (!puckerActive && kissGate.state != com.shehan.robotpet.brain.EventGateState.WAIT_RELEASE && frontal) {
+                        val alpha = if (baselineSamples < 12) 0.20f else 0.035f
+                        puckerBaseline = if (baselineSamples == 0) rawPucker else puckerBaseline * (1f - alpha) + rawPucker * alpha
+                        baselineSamples = (baselineSamples + 1).coerceAtMost(1000)
+                    }
+
+                    adaptiveKissConfidence = if (!baselineReady) 0f else {
+                        ((rawPucker - puckerBaseline) / 0.24f).coerceIn(0f, 1f)
+                    }
+                    kissDetected = kissGate.update(puckerActive, monoNow)
+
+                    updateCloseApproach(faceArea, eulerY, monoNow).also { closeApproach = it }
 
                     if (gesture?.handPresent == true) {
                         val handDistance = distance(gesture.centerX, gesture.centerY, faceX, faceY)
-                        if (handDistance < 0.22f && (puckerCandidate || now - lastKissMs < 1000L)) {
-                            handNearMouthMs = now
+                        if (handDistance < 0.22f && (puckerActive || kissDetected || adaptiveKissConfidence > 0.70f)) {
+                            handNearMouthMono = monoNow
                         }
-                        if (
-                            now - handNearMouthMs < 1700L &&
-                            handDistance > 0.30f &&
-                            handDistance - previousHandFaceDistance > 0.055f &&
-                            now - lastBlownKissMs > 3500L &&
-                            (puckerCandidate || now - lastKissMs < 1700L)
-                        ) {
+                        val outward = handDistance > 0.31f && handDistance - previousHandFaceDistance > 0.060f
+                        if (!blownLatched && monoNow - handNearMouthMono < 1700L && outward &&
+                            (puckerActive || adaptiveKissConfidence > 0.60f || monoNow - handNearMouthMono < 900L)) {
                             blownKiss = true
-                            lastBlownKissMs = now
-                            handNearMouthMs = 0L
+                            blownLatched = true
+                            blownReleaseSince = 0L
+                            handNearMouthMono = 0L
                         }
                         previousHandFaceDistance = handDistance
+                        if (blownLatched) blownReleaseSince = 0L
                     } else {
                         previousHandFaceDistance = 9f
+                        if (blownLatched) {
+                            if (blownReleaseSince == 0L) blownReleaseSince = monoNow
+                            if (monoNow - blownReleaseSince >= 650L) {
+                                blownLatched = false
+                                blownReleaseSince = 0L
+                            }
+                        }
                     }
                 } else {
-                    kissCandidateSinceMs = 0L
+                    kissGate.update(false, monoNow)
                     previousHandFaceDistance = 9f
+                    if (closeLatched) {
+                        if (closeReleaseSince == 0L) closeReleaseSince = monoNow
+                        if (monoNow - closeReleaseSince >= 900L) {
+                            closeLatched = false
+                            closeReleaseSince = 0L
+                        }
+                    }
+                    if (monoNow - lastFaceSeenMono > 2500L) {
+                        faceSeenSinceMono = 0L
+                        baselineSamples = 0
+                        puckerBaseline = 0f
+                        areaHistory.clear()
+                    }
                 }
 
                 var handGesture = gesture?.gesture ?: HandGesture.NONE
                 val handX = gesture?.centerX ?: 0.5f
                 val handY = gesture?.centerY ?: 0.5f
-
-                // Finger vertically near the lower half of the face -> shh.
                 if (
-                    handGesture == HandGesture.POINT_UP &&
-                    faceVisible &&
-                    abs(handX - faceX) < 0.16f &&
-                    handY > faceY - 0.02f &&
-                    abs(handY - faceY) < 0.26f
+                    handGesture == HandGesture.POINT_UP && faceVisible &&
+                    abs(handX - faceX) < 0.16f && handY > faceY - 0.02f && abs(handY - faceY) < 0.26f
                 ) handGesture = HandGesture.SHH
 
                 val primary = objects.detections.firstOrNull()
@@ -187,13 +247,15 @@ class VisionManager(
                         faceCenterX = faceX,
                         faceCenterY = faceY,
                         faceAreaRatio = faceArea,
+                        faceStable = faceVisible && monoNow - faceSeenSinceMono >= 900L,
+                        closeApproachDetected = closeApproach,
                         smileProbability = smile,
                         leftEyeOpenProbability = leftEye,
                         rightEyeOpenProbability = rightEye,
                         headEulerX = eulerX,
                         headEulerY = eulerY,
                         headEulerZ = eulerZ,
-                        kissConfidence = kissConfidence,
+                        kissConfidence = adaptiveKissConfidence,
                         kissDetected = kissDetected,
                         blownKissDetected = blownKiss,
                         objects = objects.detections,
@@ -211,27 +273,51 @@ class VisionManager(
                         handConfidence = gesture?.confidence ?: 0f,
                         handCenterX = handX,
                         handCenterY = handY,
-                        timestampMs = now
+                        timestampMs = wallNow
                     )
                 )
             }
             .addOnCompleteListener { proxy.close() }
     }
 
-    private fun kissScore(face: Face): Float {
+    private fun updateCloseApproach(area: Float, eulerY: Float, now: Long): Boolean {
+        while (areaHistory.isNotEmpty() && now - areaHistory.first().t > 1400L) areaHistory.removeFirst()
+        val old = areaHistory.firstOrNull { now - it.t >= 520L }
+        areaHistory.addLast(FaceAreaSample(now, area))
+
+        if (closeLatched) {
+            if (area < 0.15f) {
+                if (closeReleaseSince == 0L) closeReleaseSince = now
+                if (now - closeReleaseSince >= 900L) {
+                    closeLatched = false
+                    closeReleaseSince = 0L
+                }
+            } else closeReleaseSince = 0L
+            return false
+        }
+
+        if (old == null || old.area < 0.012f) return false
+        val ratio = area / old.area
+        val approached = area > 0.20f && ratio >= 1.42f && abs(eulerY) < 28f
+        if (approached) {
+            closeLatched = true
+            closeReleaseSince = 0L
+            return true
+        }
+        return false
+    }
+
+    private fun puckerScore(face: Face): Float {
         val upper = face.getContour(FaceContour.UPPER_LIP_TOP)?.points.orEmpty()
         val lower = face.getContour(FaceContour.LOWER_LIP_BOTTOM)?.points.orEmpty()
         val all = upper + lower
         if (all.size < 8 || face.boundingBox.width() <= 0 || face.boundingBox.height() <= 0) return 0f
-
         val mouthWidth = (all.maxOf { it.x } - all.minOf { it.x }).coerceAtLeast(1f)
         val upperY = upper.map { it.y }.average().toFloat()
         val lowerY = lower.map { it.y }.average().toFloat()
         val mouthGap = abs(lowerY - upperY)
         val widthRatio = mouthWidth / face.boundingBox.width().toFloat()
         val gapRatio = mouthGap / face.boundingBox.height().toFloat()
-
-        // A pucker usually narrows the mouth and keeps the vertical opening compact.
         val narrow = ((0.42f - widthRatio) / 0.18f).coerceIn(0f, 1f)
         val compact = ((0.105f - gapRatio) / 0.080f).coerceIn(0f, 1f)
         return (narrow * 0.72f + compact * 0.28f).coerceIn(0f, 1f)

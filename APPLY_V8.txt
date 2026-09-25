@@ -1,0 +1,10 @@
+WELLY V8 OVERLAY
+
+1. Put this ZIP in the repository root.
+2. unzip -o RobotPetHonorX7C-V8-Patch.zip
+3. rm RobotPetHonorX7C-V8-Patch.zip
+4. git add -A
+5. git commit -m "Add Welly V8 stability rebuild"
+6. git push
+
+Wait for GitHub Actions. Do not call the build successful until Unit tests, Build debug APK, and Upload artifact are all green.

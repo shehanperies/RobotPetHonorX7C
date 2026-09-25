@@ -19,27 +19,17 @@ data class ObjectFrame(
     val areaRatio: Float = detections.firstOrNull()?.areaRatio ?: 0f
 )
 
-private data class Track(
-    val id: Int,
-    val label: String,
-    val x: Float,
-    val y: Float,
-    val seenMs: Long
-)
+private data class Track(val id: Int, val label: String, val x: Float, val y: Float, val seenMs: Long)
 
-/** V6: keep every useful detection, sort by confidence and attach lightweight track IDs. */
+/** Low-rate perception only. Event/habituation decisions are made above this layer. */
 class ObjectDetectorManager(context: Context) {
     private val detector = ObjectDetector.createFromOptions(
         context,
         ObjectDetector.ObjectDetectorOptions.builder()
-            .setBaseOptions(
-                BaseOptions.builder()
-                    .setModelAssetPath("efficientdet_lite0.tflite")
-                    .build()
-            )
+            .setBaseOptions(BaseOptions.builder().setModelAssetPath("efficientdet_lite0.tflite").build())
             .setRunningMode(RunningMode.IMAGE)
-            .setMaxResults(8)
-            .setScoreThreshold(0.36f)
+            .setMaxResults(6)
+            .setScoreThreshold(0.44f)
             .build()
     )
 
@@ -49,9 +39,8 @@ class ObjectDetectorManager(context: Context) {
     private var tracks = mutableListOf<Track>()
 
     fun analyze(bitmap: Bitmap, nowMs: Long = System.currentTimeMillis()): ObjectFrame {
-        if (nowMs - lastInferenceMs < 360L) return cached
+        if (nowMs - lastInferenceMs < 430L) return cached
         lastInferenceMs = nowMs
-
         val width = bitmap.width.toFloat().coerceAtLeast(1f)
         val height = bitmap.height.toFloat().coerceAtLeast(1f)
         val result = detector.detect(BitmapImageBuilder(bitmap).build())
@@ -69,21 +58,19 @@ class ObjectDetectorManager(context: Context) {
             )
         }.sortedByDescending { it.confidence }
 
-        val aliveTracks = tracks.filter { nowMs - it.seenMs < 1800L }.toMutableList()
+        val alive = tracks.filter { nowMs - it.seenMs < 2000L }.toMutableList()
         val assigned = raw.map { item ->
-            val best = aliveTracks
-                .filter { it.label.equals(item.label, ignoreCase = true) }
+            val best = alive
+                .filter { it.label.equals(item.label, true) }
                 .minByOrNull { distance(it.x, it.y, item.centerX, item.centerY) }
-                ?.takeIf { distance(it.x, it.y, item.centerX, item.centerY) < 0.20f }
-
+                ?.takeIf { distance(it.x, it.y, item.centerX, item.centerY) < 0.18f }
             val id = best?.id ?: nextTrackId++
-            aliveTracks.removeAll { it.id == id }
-            aliveTracks += Track(id, item.label, item.centerX, item.centerY, nowMs)
+            alive.removeAll { it.id == id }
+            alive += Track(id, item.label, item.centerX, item.centerY, nowMs)
             item.copy(trackId = id)
         }
-
-        tracks = aliveTracks
-        cached = ObjectFrame(detections = assigned)
+        tracks = alive
+        cached = ObjectFrame(assigned)
         return cached
     }
 

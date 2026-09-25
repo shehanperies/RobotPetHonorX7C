@@ -97,7 +97,7 @@ fun RobotScreen(
             )
             Text(
                 when {
-                    ui.simEsp -> "SIM ESP • V6 executive"
+                    ui.simEsp -> "SIM ESP • V8 stable executive"
                     ui.robotConnected && ui.safeToMove -> "ESP32 connected • safety clear"
                     ui.robotConnected -> "ESP32 connected • movement locked"
                     else -> "Autonomous phone mode • ESP32 offline"

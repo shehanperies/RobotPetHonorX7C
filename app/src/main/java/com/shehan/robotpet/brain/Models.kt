@@ -32,7 +32,6 @@ enum class DecisionSource {
     FOLLOW, SEARCH, VISION, PHONE, BATTERY, AI, IDLE
 }
 
-/** PRIMARY is the one-at-a-time behavior lane. Other resources are physical/output lanes. */
 enum class BehaviorResource { PRIMARY, DRIVE, FORK, FACE, SPEECH, MIC }
 
 data class AiDirective(
@@ -75,6 +74,8 @@ data class VisionObservation(
     val faceCenterX: Float = 0.5f,
     val faceCenterY: Float = 0.5f,
     val faceAreaRatio: Float = 0f,
+    val faceStable: Boolean = false,
+    val closeApproachDetected: Boolean = false,
     val smileProbability: Float = -1f,
     val leftEyeOpenProbability: Float = -1f,
     val rightEyeOpenProbability: Float = -1f,

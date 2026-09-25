@@ -5,6 +5,8 @@ import com.shehan.robotpet.brain.RobotTelemetry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -33,13 +35,12 @@ data class RobotLinkDebug(
 )
 
 class RobotLink {
-    private val client = OkHttpClient.Builder()
-        .pingInterval(5, TimeUnit.SECONDS)
-        .build()
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private val client = OkHttpClient.Builder().pingInterval(5, TimeUnit.SECONDS).build()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val seq = AtomicLong(1L)
     private var socket: WebSocket? = null
     private var heartbeatJob: Job? = null
+    private var ackWatchJob: Job? = null
 
     private val _telemetry = MutableStateFlow(RobotTelemetry())
     val telemetry: StateFlow<RobotTelemetry> = _telemetry
@@ -52,8 +53,8 @@ class RobotLink {
         val request = Request.Builder().url(url).build()
         socket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                _telemetry.value = _telemetry.value.copy(connected = true, lastSeenMs = System.currentTimeMillis())
-                startHeartbeat()
+                _telemetry.value = _telemetry.value.copy(connected = true, safeToMove = false, lastSeenMs = 0L)
+                startHeartbeatAndWatchdog()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -61,8 +62,7 @@ class RobotLink {
                     val j = JSONObject(text)
                     when (j.optString("type")) {
                         "telemetry" -> {
-                            fun optionalFloat(name: String): Float? =
-                                if (j.has(name) && !j.isNull(name)) j.optDouble(name).toFloat() else null
+                            fun optionalFloat(name: String): Float? = if (j.has(name) && !j.isNull(name)) j.optDouble(name).toFloat() else null
                             _telemetry.value = RobotTelemetry(
                                 connected = true,
                                 safeToMove = j.optBoolean("safeToMove", false),
@@ -92,7 +92,10 @@ class RobotLink {
     }
 
     fun send(command: MotionCommand, durationMs: Long = 0L): Long {
-        val blocked = command != MotionCommand.STOP && !_telemetry.value.safeToMove
+        val now = System.currentTimeMillis()
+        val t = _telemetry.value
+        val telemetryFresh = t.connected && t.lastSeenMs > 0L && now - t.lastSeenMs <= 1200L
+        val blocked = command != MotionCommand.STOP && (!t.safeToMove || !telemetryFresh)
         val actual = if (blocked) MotionCommand.STOP else command
         val actualDuration = if (actual == MotionCommand.STOP) 0L else durationMs
         val commandSeq = seq.getAndIncrement()
@@ -103,38 +106,57 @@ class RobotLink {
             durationMs = actualDuration,
             queuedToWebSocket = queued,
             blockedBySafety = blocked,
-            sentAtMs = System.currentTimeMillis(),
+            sentAtMs = now,
             txSeq = commandSeq,
             ackAccepted = null,
-            ackReason = ""
+            ackReason = if (command != MotionCommand.STOP && !telemetryFresh) "STALE_TELEMETRY" else ""
         )
+        if (queued && actual != MotionCommand.STOP) watchAck(commandSeq)
         return commandSeq
     }
 
-    private fun startHeartbeat() {
+    private fun watchAck(commandSeq: Long) {
+        ackWatchJob?.cancel()
+        ackWatchJob = scope.launch {
+            delay(800L)
+            val d = _debug.value
+            if (d.txSeq == commandSeq && d.ackSeq != commandSeq) {
+                _debug.value = d.copy(ackAccepted = false, ackReason = "ACK_TIMEOUT")
+                send(MotionCommand.STOP, 0L)
+            }
+        }
+    }
+
+    private fun startHeartbeatAndWatchdog() {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
+            var tick = 0
             while (isActive) {
-                socket?.send(RobotProtocol.heartbeatJson())
-                delay(1000L)
+                if (tick % 4 == 0) socket?.send(RobotProtocol.heartbeatJson())
+                val t = _telemetry.value
+                val now = System.currentTimeMillis()
+                if (t.connected && t.lastSeenMs > 0L && now - t.lastSeenMs > 1200L && t.safeToMove) {
+                    _telemetry.value = t.copy(safeToMove = false)
+                    send(MotionCommand.STOP, 0L)
+                }
+                tick++
+                delay(250L)
             }
         }
     }
 
     private fun markDisconnected() {
-        heartbeatJob?.cancel()
+        heartbeatJob?.cancel(); ackWatchJob?.cancel()
         _telemetry.value = RobotTelemetry()
     }
 
     fun disconnect() {
-        heartbeatJob?.cancel()
-        socket?.close(1000, "bye")
-        socket = null
+        heartbeatJob?.cancel(); ackWatchJob?.cancel()
+        socket?.close(1000, "bye"); socket = null
         _telemetry.value = RobotTelemetry()
     }
 
     fun shutdown() {
-        disconnect()
-        client.dispatcher.executorService.shutdown()
+        disconnect(); client.dispatcher.executorService.shutdown(); scope.cancel()
     }
 }

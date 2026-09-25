@@ -66,7 +66,7 @@ class PetBrain {
     private var lastFollowPulseMs = 0L
 
     private var lastSpontaneousMs = 0L
-    private var nextSpontaneousDelayMs = randomLong(9000L, 18000L)
+    private var nextSpontaneousDelayMs = randomLong(45_000L, 90_000L)
     private var lastAttentionInviteMs = 0L
     private var lastSelfPlayMs = 0L
     private var lastContextPromptMs = 0L
@@ -335,7 +335,7 @@ class PetBrain {
         if (faceJustLost) {
             currentFaceVisible = false
             faceLostAtMs = now
-            scheduleSearch(now, immediate = false)
+            if (isFollowActive(now)) scheduleSearch(now, immediate = false)
         }
 
         if (v.faceVisible) {
@@ -345,7 +345,6 @@ class PetBrain {
             hadSeenFace = true
             lastFaceSeenMs = now
             lastFaceX = v.faceCenterX
-            socialNeed = (socialNeed - 1).coerceAtLeast(0)
             cancelSearch()
 
             if (faceJustAppeared && missingFor > 3500L) {
@@ -371,13 +370,13 @@ class PetBrain {
         }
 
         if (v.faceVisible && isFollowActive(now)) return smartFollow(v, telemetry)
-        if (!v.faceVisible) searchForPerson(now, telemetry)?.let { return it }
+        if (!v.faceVisible && isFollowActive(now)) searchForPerson(now, telemetry)?.let { return it }
 
         reactToObject(v)?.let { return it }
 
         if (v.faceVisible) {
             contextualPrompt(now)?.let { return it }
-            if (socialNeed >= 78 && now - lastAttentionInviteMs > 120_000L && now - faceStableSinceMs > 5000L) {
+            if (socialNeed >= 78 && now - lastAttentionInviteMs > 180_000L && now - faceStableSinceMs > 5000L) {
                 lastAttentionInviteMs = now
                 socialNeed = (socialNeed - 14).coerceAtLeast(0)
                 return BrainDecision(
@@ -440,7 +439,7 @@ class PetBrain {
         if (telemetry.connected && !telemetry.safeToMove) {
             return BrainDecision(Emotion.STARTLED, PetMode.EMERGENCY, motion = MotionCommand.STOP, interruptMotion = true, status = "Safety stop", behaviorKey = "safety-stop", minimumHoldMs = 900L)
         }
-        if (!currentFaceVisible) searchForPerson(nowMs, telemetry)?.let { return it }
+        if (!currentFaceVisible && isFollowActive(nowMs)) searchForPerson(nowMs, telemetry)?.let { return it }
 
         val quietFor = nowMs - maxOf(lastInteractionMs, lastFaceSeenMs)
         if (quietFor > 25 * 60_000L && energy < 68) {
@@ -448,7 +447,7 @@ class PetBrain {
             return BrainDecision(Emotion.SLEEPY, PetMode.SLEEPING, speech = if (Random.nextBoolean()) "Nap time." else null, sequence = forkRest(), status = "Auto sleep", behaviorKey = "auto-sleep", minimumHoldMs = 2200L)
         }
 
-        if (!currentFaceVisible && boredom >= 70 && nowMs - lastSelfPlayMs > 45_000L) {
+        if (!currentFaceVisible && boredom >= 70 && nowMs - lastSelfPlayMs > 90_000L) {
             lastSelfPlayMs = nowMs
             boredom = (boredom - 16).coerceAtLeast(0)
             return BrainDecision(
@@ -461,7 +460,7 @@ class PetBrain {
 
         if (nowMs - lastSpontaneousMs >= nextSpontaneousDelayMs) {
             lastSpontaneousMs = nowMs
-            nextSpontaneousDelayMs = randomLong(9000L, 20_000L)
+            nextSpontaneousDelayMs = randomLong(45_000L, 90_000L)
             val roll = Random.nextInt(100)
             if (roll < 58) return BrainDecision(Emotion.CURIOUS, if (currentFaceVisible) PetMode.ENGAGED else PetMode.IDLE, gazeX = randomFloat(-0.7f, 0.7f), gazeY = randomFloat(-0.18f, 0.18f), status = "Looking around", behaviorKey = "micro-look")
             if (roll < 76 && boredom >= 38) return BrainDecision(Emotion.PLAYFUL, PetMode.IDLE, gazeX = randomFloat(-0.45f, 0.45f), sequence = if (Random.nextInt(100) < 35) forkCurious() else emptyList(), status = "Little playful moment", behaviorKey = "micro-play", minimumHoldMs = 1500L)
@@ -596,7 +595,7 @@ class PetBrain {
             return BrainDecision(Emotion.HAPPY, PetMode.ENGAGED, gazeX = gaze, speech = if (Random.nextBoolean()) "Nice smile!" else null, status = "Smile confirmed", behaviorKey = "smile", minimumHoldMs = 1500L)
         }
 
-        if (!v.handPresent && v.faceAreaRatio > 0.31f && now - lastCloseFaceMs > 9000L) {
+        if (!v.handPresent && v.closeApproachDetected && now - lastCloseFaceMs > 9000L) {
             lastCloseFaceMs = now
             return BrainDecision(Emotion.STARTLED, PetMode.ENGAGED, gazeX = gaze, speech = "Whoa, close!", sequence = forkStartle(), status = "Close face", behaviorKey = "close-face", minimumHoldMs = 1600L)
         }
@@ -624,7 +623,7 @@ class PetBrain {
 
     private fun reactToObject(v: VisionObservation): BrainDecision? {
         val target = v.objects.firstOrNull { !it.label.equals("person", true) } ?: return null
-        if (target.confidence < 0.42f) return null
+        if (target.confidence < 0.50f) return null
         val now = v.timestampMs
         val label = target.label.lowercase()
         val count = (objectSeenCount[label] ?: 0) + 1
