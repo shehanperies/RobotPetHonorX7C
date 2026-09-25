@@ -32,6 +32,32 @@ enum class PhoneEvent {
     NONE, SHAKE, TILT_LEFT, TILT_RIGHT, UPSIDE_DOWN, DARK, BRIGHT
 }
 
+enum class PetMode {
+    IDLE, ENGAGED, FOLLOWING, SEARCHING, LISTENING, SLEEPING, REMOTE, THINKING
+}
+
+enum class AiAction {
+    NONE, CHAT, GREET, PLAY, SEARCH, FOLLOW, LOOK_LEFT, LOOK_RIGHT, FORK_WAVE, REST
+}
+
+data class AiDirective(
+    val action: AiAction = AiAction.NONE,
+    val speech: String? = null,
+    val emotion: String = "",
+    val reason: String = ""
+)
+
+data class PetMindSnapshot(
+    val mood: Int = 0,
+    val annoyance: Int = 0,
+    val socialNeed: Int = 0,
+    val boredom: Int = 0,
+    val curiosity: Int = 0,
+    val energy: Int = 100,
+    val followActive: Boolean = false,
+    val searchActive: Boolean = false
+)
+
 data class MotionStep(
     val command: MotionCommand,
     val durationMs: Long,
@@ -57,6 +83,8 @@ data class VisionObservation(
     val objectLabel: String? = null,
     val objectConfidence: Float = 0f,
 
+    val handPresent: Boolean = false,
+    val rawHandLabel: String = "",
     val handGesture: HandGesture = HandGesture.NONE,
     val handConfidence: Float = 0f,
     val handCenterX: Float = 0.5f,
@@ -84,11 +112,13 @@ data class RobotTelemetry(
 
 data class BrainDecision(
     val emotion: Emotion,
+    val mode: PetMode = PetMode.IDLE,
     val gazeX: Float = 0f,
     val gazeY: Float = 0f,
     val speech: String? = null,
     val motion: MotionCommand = MotionCommand.STOP,
     val motionDurationMs: Long = 0L,
     val sequence: List<MotionStep> = emptyList(),
+    val interruptMotion: Boolean = false,
     val status: String = "Idle"
 )

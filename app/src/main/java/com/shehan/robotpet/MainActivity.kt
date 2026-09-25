@@ -56,6 +56,12 @@ class MainActivity : ComponentActivity() {
                     initialUrl = engine.currentRobotUrl(),
                     initialFollow = engine.currentFollowEnabled(),
                     initialVoiceLanguage = engine.currentVoiceLanguage(),
+                    initialVoiceName = engine.currentVoiceName(),
+                    initialVoicePreset = engine.currentVoicePreset(),
+                    initialGeminiEnabled = engine.currentGeminiEnabled(),
+                    initialGeminiModel = engine.currentGeminiModel(),
+                    initialRemoteEnabled = engine.currentRemoteEnabled(),
+                    initialRemotePort = engine.currentRemotePort(),
                     onTouch = engine::touch,
                     onPet = engine::pet,
                     onListen = engine::listen,
@@ -64,6 +70,9 @@ class MainActivity : ComponentActivity() {
                     onDisconnect = engine::disconnectRobot,
                     onTestingChanged = engine::setTesting,
                     onSimEspChanged = engine::setSimEsp,
+                    onTestGemini = engine::testGemini,
+                    onRefreshGemini = engine::refreshGeminiModels,
+                    onClearGeminiKey = engine::clearGeminiKey,
                     onSaveSettings = engine::updateSettings
                 )
             }

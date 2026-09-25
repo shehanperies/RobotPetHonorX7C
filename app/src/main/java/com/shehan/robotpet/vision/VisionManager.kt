@@ -19,7 +19,8 @@ import kotlin.math.abs
 
 class VisionManager(
     private val context: Context,
-    private val onObservation: (VisionObservation) -> Unit
+    private val onObservation: (VisionObservation) -> Unit,
+    private val onFrame: ((Bitmap) -> Unit)? = null
 ) {
     private val executor = Executors.newSingleThreadExecutor()
     private var provider: ProcessCameraProvider? = null
@@ -128,6 +129,7 @@ class VisionManager(
         }
 
         val now = System.currentTimeMillis()
+        runCatching { onFrame?.invoke(bitmap) }
         val width = bitmap.width.toFloat().coerceAtLeast(1f)
         val height = bitmap.height.toFloat().coerceAtLeast(1f)
 
@@ -210,6 +212,8 @@ class VisionManager(
                         objectLabel = obj.label,
                         objectConfidence = obj.confidence,
 
+                        handPresent = gesture?.handPresent == true,
+                        rawHandLabel = gesture?.rawLabel.orEmpty(),
                         handGesture = handGesture,
                         handConfidence = gesture?.confidence ?: 0f,
                         handCenterX = handX,

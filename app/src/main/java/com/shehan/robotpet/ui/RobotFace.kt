@@ -38,10 +38,10 @@ fun RobotFace(
 
     LaunchedEffect(Unit) {
         while (true) {
-            delay(Random.nextLong(2600, 6200))
-            blink.animateTo(0.05f, tween(70))
+            delay(Random.nextLong(2800, 6500))
+            blink.animateTo(0.08f, tween(65))
             blink.animateTo(1f, tween(115))
-            drift = Random.nextFloat() * 0.1f - 0.05f
+            drift = Random.nextFloat() * 0.08f - 0.04f
         }
     }
 
@@ -67,28 +67,31 @@ fun RobotFace(
     ) {
         val w = size.width
         val h = size.height
-        val eyeW = w * 0.23f
-        val baseEyeH = h * 0.13f
+        val unit = minOf(w, h)
+
+        // Size from the short screen edge so portrait and landscape keep the same eye proportions.
+        val eyeW = unit * 0.31f
+        val baseEyeH = unit * 0.155f
 
         val emotionScale = when (emotion) {
-            Emotion.HAPPY -> 0.58f
-            Emotion.LOVE -> 0.52f
-            Emotion.SLEEPY -> 0.22f
-            Emotion.LISTENING -> 1.08f
-            Emotion.STARTLED -> 1.18f
-            Emotion.SAD, Emotion.LONELY -> 0.66f
-            Emotion.ANGRY -> 0.62f
-            Emotion.PLAYFUL -> 0.82f
-            Emotion.DIZZY -> 0.76f
+            Emotion.HAPPY -> 0.62f
+            Emotion.LOVE -> 0.58f
+            Emotion.SLEEPY -> 0.28f
+            Emotion.LISTENING -> 1.05f
+            Emotion.STARTLED -> 1.22f
+            Emotion.SAD, Emotion.LONELY -> 0.70f
+            Emotion.ANGRY -> 0.66f
+            Emotion.PLAYFUL -> 0.86f
+            Emotion.DIZZY -> 0.82f
             else -> 1f
         }
 
-        val eyeH = baseEyeH * blink.value * emotionScale
-        val xShift = (gazeX + drift).coerceIn(-1f, 1f) * w * 0.055f
-        val yShift = gazeY.coerceIn(-1f, 1f) * h * 0.025f
-        val centerY = h * 0.46f + yShift
-        val leftCenter = Offset(w * 0.34f + xShift, centerY)
-        val rightCenter = Offset(w * 0.66f + xShift, centerY)
+        val eyeH = (baseEyeH * blink.value * emotionScale).coerceAtLeast(unit * 0.014f)
+        val xShift = (gazeX + drift).coerceIn(-1f, 1f) * unit * 0.055f
+        val yShift = gazeY.coerceIn(-1f, 1f) * unit * 0.035f
+        val centerY = h * 0.50f + yShift
+        val leftCenter = Offset(w * 0.32f + xShift, centerY)
+        val rightCenter = Offset(w * 0.68f + xShift, centerY)
 
         val glow = when (emotion) {
             Emotion.ANGRY -> Color(0xFFFF675C)
@@ -97,6 +100,7 @@ fun RobotFace(
             Emotion.STARTLED -> Color(0xFFFFD86A)
             Emotion.HAPPY -> Color(0xFF79F5D0)
             Emotion.LOVE -> Color(0xFFFF8FCB)
+            Emotion.LISTENING -> Color(0xFF8EEBFF)
             else -> Color(0xFF7DE7FF)
         }
 
@@ -104,36 +108,26 @@ fun RobotFace(
             rotate(rotation, center) {
                 drawRoundRect(
                     color = glow.copy(alpha = 0.12f),
-                    topLeft = Offset(
-                        center.x - eyeW * 0.56f,
-                        center.y - eyeH * 0.62f
-                    ),
-                    size = Size(eyeW * 1.12f, eyeH * 1.24f),
-                    cornerRadius = CornerRadius(eyeH * 0.48f)
+                    topLeft = Offset(center.x - eyeW * 0.56f, center.y - eyeH * 0.64f),
+                    size = Size(eyeW * 1.12f, eyeH * 1.28f),
+                    cornerRadius = CornerRadius(eyeH * 0.52f)
                 )
-
                 drawRoundRect(
                     color = glow,
-                    topLeft = Offset(
-                        center.x - eyeW / 2,
-                        center.y - eyeH / 2
-                    ),
-                    size = Size(
-                        eyeW,
-                        eyeH.coerceAtLeast(5f)
-                    ),
-                    cornerRadius = CornerRadius(eyeH * 0.45f)
+                    topLeft = Offset(center.x - eyeW / 2f, center.y - eyeH / 2f),
+                    size = Size(eyeW, eyeH),
+                    cornerRadius = CornerRadius(eyeH * 0.48f)
                 )
             }
         }
 
         val tilt = when (emotion) {
             Emotion.CURIOUS -> 4f
-            Emotion.STARTLED -> -5f
-            Emotion.SAD, Emotion.LONELY -> 9f
-            Emotion.ANGRY -> -11f
+            Emotion.STARTLED -> -4f
+            Emotion.SAD, Emotion.LONELY -> 8f
+            Emotion.ANGRY -> -10f
             Emotion.PLAYFUL -> -3f
-            Emotion.DIZZY -> 12f
+            Emotion.DIZZY -> 11f
             Emotion.LOVE -> -2f
             else -> 0f
         }

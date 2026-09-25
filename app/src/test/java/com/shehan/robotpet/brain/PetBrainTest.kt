@@ -6,13 +6,14 @@ import org.junit.Test
 
 class PetBrainTest {
     @Test
-    fun stopCommandAlwaysStops() {
+    fun stopCommandAlwaysStopsAndInterrupts() {
         val brain = PetBrain()
         val d = brain.onSpeech(
             "please stop",
             RobotTelemetry(connected = true, safeToMove = true)
         )
         assertEquals(MotionCommand.STOP, d.motion)
+        assertTrue(d.interruptMotion)
     }
 
     @Test
@@ -38,11 +39,11 @@ class PetBrainTest {
             RobotTelemetry(connected = true, safeToMove = true)
         )
         assertEquals(MotionCommand.STOP, d.motion)
-        assertTrue(d.status.contains("STOP"))
+        assertTrue(d.interruptMotion)
     }
 
     @Test
-    fun thumbsUpIsHappy() {
+    fun thumbsUpIsHappyAndUsesForkExpression() {
         val brain = PetBrain()
         val d = brain.onVision(
             VisionObservation(
@@ -98,25 +99,79 @@ class PetBrainTest {
     }
 
     @Test
-    fun lostPersonStartsSearch() {
+    fun lostPersonWaitsBeforePhysicalSearch() {
         val brain = PetBrain()
+
         brain.onVision(
             VisionObservation(
                 faceVisible = true,
                 faceCenterX = 0.5f,
                 timestampMs = 1_000L
             ),
-            RobotTelemetry()
+            RobotTelemetry(connected = true, safeToMove = true)
         )
 
-        val d = brain.onVision(
+        val justLost = brain.onVision(
             VisionObservation(
                 faceVisible = false,
                 timestampMs = 6_000L
             ),
+            RobotTelemetry(connected = true, safeToMove = true)
+        )
+
+        assertEquals(MotionCommand.STOP, justLost.motion)
+        assertTrue(justLost.status.contains("waiting", ignoreCase = true))
+
+        val afterMaximumWait = brain.onVision(
+            VisionObservation(
+                faceVisible = false,
+                timestampMs = 14_000L
+            ),
+            RobotTelemetry(connected = true, safeToMove = true)
+        )
+
+        assertTrue(
+            afterMaximumWait.motion == MotionCommand.LEFT ||
+                afterMaximumWait.motion == MotionCommand.RIGHT
+        )
+    }
+
+    @Test
+    fun seeingFarFaceDoesNotAutoDriveWithoutFollowCommand() {
+        val brain = PetBrain()
+        val d = brain.onVision(
+            VisionObservation(
+                faceVisible = true,
+                faceCenterX = 0.1f,
+                faceAreaRatio = 0.01f,
+                timestampMs = 70_000L
+            ),
+            RobotTelemetry(connected = true, safeToMove = true)
+        )
+        assertEquals(MotionCommand.STOP, d.motion)
+        assertEquals(PetMode.ENGAGED, d.mode)
+    }
+
+    @Test
+    fun aiCannotBypassFollowPermission() {
+        val brain = PetBrain()
+        brain.setFollowEnabled(false)
+
+        brain.onVision(
+            VisionObservation(
+                faceVisible = true,
+                timestampMs = 100_000L
+            ),
             RobotTelemetry()
         )
 
-        assertTrue(d.status.contains("Looking") || d.status.contains("Searching"))
+        val d = brain.onAiDirective(
+            AiDirective(action = AiAction.FOLLOW, speech = "Let's go"),
+            RobotTelemetry(connected = true, safeToMove = true),
+            now = 101_000L
+        )
+
+        assertEquals(MotionCommand.STOP, d.motion)
+        assertTrue(d.status.contains("ignored"))
     }
 }
