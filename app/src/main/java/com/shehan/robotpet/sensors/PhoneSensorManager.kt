@@ -7,7 +7,6 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import com.shehan.robotpet.brain.PhoneEvent
 import com.shehan.robotpet.brain.PhoneObservation
-import kotlin.math.abs
 import kotlin.math.sqrt
 
 class PhoneSensorManager(
@@ -17,24 +16,16 @@ class PhoneSensorManager(
 
     private val manager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
     private val accelerometer = manager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-    private val rotation = manager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
     private val light = manager.getDefaultSensor(Sensor.TYPE_LIGHT)
 
-    private var pitchDeg = 0f
-    private var rollDeg = 0f
     private var gForce = 1f
     private var lux: Float? = null
-
-    private var lastEmitMs = 0L
     private var lastShakeMs = 0L
-    private var lastOrientationEvent = PhoneEvent.NONE
     private var lastLightEvent = PhoneEvent.NONE
+    private var lastLightEmitMs = 0L
 
     fun start() {
         accelerometer?.let {
-            manager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
-        }
-        rotation?.let {
             manager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
         light?.let {
@@ -57,62 +48,38 @@ class PhoneSensorManager(
                 val z = event.values[2]
                 gForce = sqrt(x * x + y * y + z * z) / SensorManager.GRAVITY_EARTH
 
-                if (gForce > 2.25f && now - lastShakeMs > 1400L) {
+                if (gForce > 2.55f && now - lastShakeMs > 2200L) {
                     lastShakeMs = now
                     detected = PhoneEvent.SHAKE
                 }
             }
 
-            Sensor.TYPE_ROTATION_VECTOR -> {
-                val matrix = FloatArray(9)
-                val orientation = FloatArray(3)
-                SensorManager.getRotationMatrixFromVector(matrix, event.values)
-                SensorManager.getOrientation(matrix, orientation)
-
-                pitchDeg = Math.toDegrees(orientation[1].toDouble()).toFloat()
-                rollDeg = Math.toDegrees(orientation[2].toDouble()).toFloat()
-
-                val orientationEvent = when {
-                    abs(rollDeg) > 135f -> PhoneEvent.UPSIDE_DOWN
-                    rollDeg > 45f -> PhoneEvent.TILT_RIGHT
-                    rollDeg < -45f -> PhoneEvent.TILT_LEFT
-                    else -> PhoneEvent.NONE
-                }
-
-                if (orientationEvent != PhoneEvent.NONE &&
-                    orientationEvent != lastOrientationEvent &&
-                    now - lastEmitMs > 1200L
-                ) {
-                    detected = orientationEvent
-                }
-                lastOrientationEvent = orientationEvent
-            }
-
             Sensor.TYPE_LIGHT -> {
                 lux = event.values.firstOrNull()
                 val lightEvent = when {
-                    (lux ?: 100f) < 5f -> PhoneEvent.DARK
-                    (lux ?: 100f) > 2500f -> PhoneEvent.BRIGHT
+                    (lux ?: 100f) < 4f -> PhoneEvent.DARK
+                    (lux ?: 100f) > 3000f -> PhoneEvent.BRIGHT
                     else -> PhoneEvent.NONE
                 }
 
-                if (lightEvent != PhoneEvent.NONE &&
+                if (
+                    lightEvent != PhoneEvent.NONE &&
                     lightEvent != lastLightEvent &&
-                    now - lastEmitMs > 5000L
+                    now - lastLightEmitMs > 8000L
                 ) {
                     detected = lightEvent
+                    lastLightEmitMs = now
                 }
                 lastLightEvent = lightEvent
             }
         }
 
         if (detected != PhoneEvent.NONE) {
-            lastEmitMs = now
             onObservation(
                 PhoneObservation(
                     event = detected,
-                    pitchDeg = pitchDeg,
-                    rollDeg = rollDeg,
+                    pitchDeg = 0f,
+                    rollDeg = 0f,
                     gForce = gForce,
                     lux = lux,
                     timestampMs = now
